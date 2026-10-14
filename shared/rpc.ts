@@ -32,7 +32,7 @@ export const cancelLogin = defineRpc({
 });
 
 export const addVertexAccount = defineRpc({
-  name: "zerosub.accounts.addVertex",
+  name: "zerosub.accounts.add-vertex",
   input: z.object({
     projectId: z.string().trim().min(1),
     region: z.string().trim().min(1),
