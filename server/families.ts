@@ -58,6 +58,11 @@ const CACHE_MS = 30_000;
 export class FamilyResolver {
   private cache: { at: number; value: Record<string, Family> } | null = null;
 
+  /** Forget the cached profiles, e.g. right after ZeroSub changed them. */
+  invalidate(): void {
+    this.cache = null;
+  }
+
   async resolve(paseo: PaseoApi): Promise<Record<string, Family>> {
     if (this.cache && Date.now() - this.cache.at < CACHE_MS) return this.cache.value;
     let value: Record<string, Family>;

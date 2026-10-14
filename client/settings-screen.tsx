@@ -86,6 +86,13 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
       <SettingsSection title="New agents and composer">
         <SettingsCard>
           <SettingsSwitch
+            label="List each account as its own provider"
+            hint="Adds “Claude · work”, “ChatGPT · team”… to the new-agent picker, so a new chat starts on the account you pick there."
+            value={settings.values.accountProviders}
+            disabled={settings.saving}
+            onValueChange={(accountProviders) => save({ accountProviders })}
+          />
+          <SettingsSwitch
             label="Spread new agents across accounts"
             hint="New agents start on the account with the most room instead of the default."
             value={settings.values.balanceNewAgents}

@@ -30,6 +30,7 @@ import {
   type RedeemReply,
   type UsageRead,
 } from "./adapter";
+import { accountForProvider, desiredAccountProviders, syncAccountProviders } from "./account-providers";
 import { FamilyResolver } from "./families";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
@@ -89,6 +90,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   showComposerPill: true,
   autoRedeem: false,
   forkOtherProvider: false,
+  accountProviders: true,
 };
 
 interface LoginSession {
@@ -169,11 +171,36 @@ export class Service {
 
   setPreferences(prefs: Preferences): void {
     this.prefs = prefs;
+    this.requestProviderSync();
   }
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
   attach(paseo: PaseoApi): void {
-    this.paseo ??= paseo;
+    if (this.paseo) return;
+    this.paseo = paseo;
+    this.requestProviderSync();
+  }
+
+  private readonly providerSyncLock = new Mutex();
+  /** What the provider profiles were last made to match, so unchanged accounts cost no config read. */
+  private providerSyncKey: string | null = null;
+
+  /** Keeps one provider profile per account in the daemon config ("Claude · work"). */
+  private requestProviderSync(): void {
+    const paseo = this.paseo;
+    if (!paseo) return;
+    void this.providerSyncLock
+      .run(async () => {
+        const state = await this.store.read();
+        const key = JSON.stringify(desiredAccountProviders(state, this.prefs.accountProviders));
+        if (key === this.providerSyncKey) return;
+        if (await syncAccountProviders(paseo, state, this.prefs.accountProviders)) {
+          this.families.invalidate?.();
+          console.log("[ZeroSub] updated the per-account providers");
+        }
+        this.providerSyncKey = key;
+      })
+      .catch((error: unknown) => log("could not update the per-account providers", error));
   }
 
   async start(): Promise<void> {
@@ -244,6 +271,8 @@ export class Service {
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
     if (this.paseo) await this.collectOrphanHomes(this.paseo);
+    // Catches accounts added, renamed or removed elsewhere (another client, identity updates).
+    this.requestProviderSync();
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
@@ -345,11 +374,18 @@ export class Service {
     context: PluginHookContext,
   ): Promise<PluginSessionOpenRequest | undefined> {
     this.attach(context.paseo);
-    const family = (await this.families.resolve(context.paseo))[request.provider];
+    const now = Date.now();
+    let state = await this.store.read();
+    // Picked as "Claude · work" in the new-agent picker: the session starts on that account.
+    const picked = accountForProvider(state, request.provider);
+    const family = picked?.family ?? (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
     const adapter = this.adapters[family];
-    const now = Date.now();
-    const state = await this.store.read();
+    if (picked && request.reason === "create" && !state.bindings[request.agentId]) {
+      state = await this.store.update((draft) => {
+        draft.bindings[request.agentId] ??= { accountId: picked.id, source: "user", at: new Date(now).toISOString() };
+      });
+    }
     const decision = chooseAccount(state, {
       agentId: request.agentId,
       family,
@@ -1506,6 +1542,7 @@ export class Service {
       draft.accounts.push(account);
     });
     console.log(`[ZeroSub] added Vertex AI fallback ${config.projectId} (${config.region})`);
+    this.requestProviderSync();
     return id;
   }
 
@@ -1517,6 +1554,7 @@ export class Service {
       account.autoLabel = false;
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
+    this.requestProviderSync();
   }
 
   async remove(paseo: PaseoApi, accountId: string): Promise<number> {
@@ -1560,6 +1598,7 @@ export class Service {
     // cleanup pass only once nothing runs on it any more.
     await this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]));
     void this.collectOrphanHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
+    this.requestProviderSync();
     return affected.length;
   }
 
@@ -1702,6 +1741,7 @@ export class Service {
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
+    this.requestProviderSync();
   }
 
   private failLogin(session: LoginSession, message: string): void {

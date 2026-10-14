@@ -74,6 +74,14 @@ ZeroSub tries these in order, and a timeline note says which one happened:
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
 3. **Stop and say so**, with the time the account frees up.
 
+## Pick the account when you start a chat
+
+Every account also appears as its own provider in Paseo's new-agent picker: **Claude · work**, **Claude · personal**, **ChatGPT · team**, and so on. Pick one and the new chat starts on that account, pinned there like an account chosen from the account button. Plain **Claude** / **Codex** still follow the default.
+
+- ZeroSub keeps these entries (IDs starting with `zs-`) in the daemon config in sync as you add, rename and remove accounts, and never touches other provider entries.
+- Automatic switching still applies: if the picked account hits its limit, the chat moves on like any other.
+- Turn it off with **List each account as its own provider** in Accounts or **Settings → Plugins → zerosub**; ZeroSub then removes its entries.
+
 ## Vertex AI fallback (Claude)
 
 Add Claude on Google Vertex AI as a pay-per-use safety net: **Accounts → Claude → Vertex AI**, then enter the Google Cloud project ID and region (`global`, `us-east5`, …).

@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter, LimitHit, UsageRead } from "./adapter";
 import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
@@ -59,8 +59,12 @@ function fakePaseo() {
   const sent: string[] = [];
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
   const agent = { id: AGENT, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z" };
+  const patches: unknown[] = [];
   const paseo = {
-    config: { get: async () => ({ config: { providers: {} } }) },
+    config: {
+      get: async () => ({ config: { providers: {} } }),
+      patch: async (patch: unknown) => void patches.push(patch),
+    },
     agents: {
       list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
       ref: () => ({
@@ -74,7 +78,7 @@ function fakePaseo() {
       }),
     },
   };
-  return { paseo, sent, notes };
+  return { paseo, sent, notes, patches };
 }
 
 interface SetUpOptions {
@@ -482,5 +486,35 @@ describe("Vertex AI fallback", () => {
     await doneTurn(service, { paseo });
     expect((await store.read()).bindings[AGENT]?.accountId).toBe(VERTEX);
     expect(reopened).toEqual([]);
+  });
+});
+
+describe("per-account providers", () => {
+  it("starts a new agent picked as \"Claude · hello\" on hello, pinned there", async () => {
+    const { service, store, paseo } = await setUp(
+      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null } },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    const opened = await service.onSessionOpen(
+      { agentId: AGENT, provider: `zs-${HELLO}`, reason: "create", purpose: "interactive", env: {} } as never,
+      { paseo } as never,
+    );
+    expect(opened?.env).toMatchObject({ CLAUDE_CONFIG_DIR: join(tmpdir(), HELLO) });
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "user" });
+  });
+
+  it("adds one provider profile per account to the daemon config", async () => {
+    const { service, paseo, patches } = await setUp(
+      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null } },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    service.attach(paseo as never);
+    await vi.waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]).toEqual({
+      providers: {
+        [`zs-${MAIN}`]: { extends: "claude", label: "Claude · marketing", description: "ZeroSub: new agents start on marketing" },
+        [`zs-${HELLO}`]: { extends: "claude", label: "Claude · hello", description: "ZeroSub: new agents start on hello" },
+      },
+    });
   });
 });
