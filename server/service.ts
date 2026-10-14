@@ -40,7 +40,8 @@ import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, mostAvailable } from "./routing";
+import { validateVertexConfig, vertexEnv, vertexIdentity, vertexUsage } from "./vertex";
+import { chooseAccount, isLimited, mostAvailable, vertexFallback } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -249,7 +250,10 @@ export class Service {
     this.identityCheckedAt.set(accountId, Date.now());
     const account = findAccount(await this.store.read(), accountId);
     if (!account) return;
-    const identity = await this.adapters[account.family].identity(account.home).catch(() => null);
+    const identity =
+      account.kind === "vertex" && account.vertex
+        ? vertexIdentity(account.vertex)
+        : await this.adapters[account.family].identity(account.home).catch(() => null);
     if (!identity) return;
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
@@ -383,7 +387,8 @@ export class Service {
         decision.skipped ? `; skipped ${decision.skipped.account.label}: ${decision.skipped.why}` : ""
       })`,
     );
-    return { ...request, env: applyEnv(await adapter.env(account.home), request.env) };
+    const patch = account.kind === "vertex" && account.vertex ? vertexEnv(account.vertex) : await adapter.env(account.home);
+    return { ...request, env: applyEnv(patch, request.env) };
   }
 
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */
@@ -411,6 +416,7 @@ export class Service {
       }
     }
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+    else if (await this.returnFromVertex(context.paseo, agentId, family)) return;
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
   }
@@ -423,6 +429,41 @@ export class Service {
     await this.store.update((draft) => {
       delete draft.sessions[agentId];
     });
+  }
+
+  /**
+   * Vertex bills per use, so an agent that fell back to it moves back to a subscription account as
+   * soon as one has room, between turns. One the user put on Vertex themselves stays there.
+   */
+  private async returnFromVertex(paseo: PaseoApi, agentId: string, family: Family): Promise<boolean> {
+    if (!this.prefs.autoSwitch || !this.adapters[family].portable) return false;
+    const state = await this.store.read();
+    const current = findAccount(state, this.runningOn(state, agentId, family));
+    if (current?.kind !== "vertex" || state.bindings[agentId]?.source === "user") return false;
+    const now = Date.now();
+    const back = mostAvailable(state, family, (id) => this.usage.get(id), now);
+    if (!back || !this.switchGuard.allows(agentId, now)) return false;
+    const at = new Date(now).toISOString();
+    await this.store.update((draft) => {
+      draft.bindings[agentId] = { accountId: back.id, source: "auto", at };
+    });
+    this.switchGuard.note(agentId, now);
+    const outcome = await this.reopenAgent(paseo, agentId, null, true);
+    const row: SwitchRow = {
+      family,
+      from: current.label,
+      to: back.label,
+      reason: "returned",
+      resetsAt: null,
+      continued: false,
+      continuedIn: null,
+      toFamily: null,
+      outcome: outcome === "reopened" ? "switched" : "pending",
+      detail: null,
+      at,
+    };
+    await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+    return true;
   }
 
   /** Re-checks the account an agent was using; true when it really is signed out now. */
@@ -553,7 +594,7 @@ export class Service {
       }
       return;
     }
-    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    let next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -593,6 +634,10 @@ export class Service {
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
+      // Every subscription is out and no reset helped: carry on, in place, on pay-per-use Vertex.
+      next = adapter.portable ? vertexFallback(latest, family, now, new Set([account.id])) : undefined;
+    }
+    if (!next) {
       if (reason !== "limit") return;
       let detail: string | null = null;
       if (this.prefs.forkOtherProvider) {
@@ -1138,6 +1183,10 @@ export class Service {
     const task = (async () => {
       const account = findAccount(await this.store.read(), accountId);
       if (!account) return;
+      if (account.kind === "vertex") {
+        this.setUsage(accountId, vertexUsage());
+        return;
+      }
       const spacing = this.adapters[account.family].usageSpacingMs;
       if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
       this.usageAttemptAt.set(accountId, Date.now());
@@ -1236,6 +1285,7 @@ export class Service {
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
+        vertex: account.vertex,
       };
     });
 
@@ -1303,6 +1353,9 @@ export class Service {
     if (!account) throw new Error("That account no longer exists.");
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
     if (account.disabled) throw new Error(`${account.label} is disabled. Enable it before making it the default.`);
+    if (account.kind === "vertex") {
+      throw new Error(`${account.label} bills per use, so it is only used once every subscription account is out.`);
+    }
     if (!this.adapters[account.family].portable) await this.pinThreads(paseo, account.family);
     await this.store.update((draft) => {
       draft.defaults[account.family] = account.id;
@@ -1323,7 +1376,9 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.disabled === !enabled) return { ...emptySummary(), stayed: 0 };
-    if (!enabled && !accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled)) {
+    const inUse = (other: StoredAccount) =>
+      other.id !== account.id && other.kind !== "vertex" && other.signedIn && !other.disabled;
+    if (!enabled && account.kind !== "vertex" && !accountsOf(state, account.family).some(inUse)) {
       // With nothing else to route to, sessions would quietly fall back to the CLI login.
       throw new Error(`${account.label} is the only ${FAMILY_LABEL[account.family]} account in use. Add or enable another one first.`);
     }
@@ -1428,6 +1483,30 @@ export class Service {
       else delete draft.bindings[agentId];
     });
     return this.reconcile(paseo, "manual", [agentId]);
+  }
+
+  /**
+   * Adds Claude on Vertex AI as a pay-per-use fallback. There is no sign-in: Claude Code uses the
+   * machine's Google Application Default Credentials, so the account reads as signed out until
+   * `gcloud auth application-default login` has been run on the daemon host.
+   */
+  async addVertexAccount(input: { projectId: string; region: string; label?: string }): Promise<string> {
+    const config = validateVertexConfig(input);
+    const identity = vertexIdentity(config);
+    const id = `claude-vertex-${randomBytes(6).toString("hex")}`;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((account) => account.identity === identity.identity)) {
+        throw new Error(`Vertex AI for ${config.projectId} in ${config.region} is already added.`);
+      }
+      const account = newAccount({ id, family: "claude", kind: "vertex", home: null });
+      account.vertex = config;
+      applyIdentity(account, identity, draft);
+      account.label = input.label?.trim() || `Vertex · ${config.projectId}`;
+      account.autoLabel = false;
+      draft.accounts.push(account);
+    });
+    console.log(`[ZeroSub] added Vertex AI fallback ${config.projectId} (${config.region})`);
+    return id;
   }
 
   async rename(accountId: string, label: string): Promise<void> {
@@ -1650,6 +1729,7 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    vertex: null,
     createdAt: new Date().toISOString(),
   };
 }

@@ -74,6 +74,17 @@ ZeroSub tries these in order, and a timeline note says which one happened:
    - With the option off, a stopped agent's account button offers **Continue on ChatGPT (new agent)…** (or Claude) instead, with a confirmation.
 3. **Stop and say so**, with the time the account frees up.
 
+## Vertex AI fallback (Claude)
+
+Add Claude on Google Vertex AI as a pay-per-use safety net: **Accounts → Claude → Vertex AI**, then enter the Google Cloud project ID and region (`global`, `us-east5`, …).
+
+- **Last resort only.** Agents move to Vertex only when no Claude subscription account is usable (limited or signed out), after a banked reset (if you turned automatic resets on) and before forking to ChatGPT. The conversation continues in place.
+- **Moves back by itself.** After each turn on Vertex, the agent returns to a subscription account as soon as one has room again. An agent you put on Vertex yourself (from its account button) stays there.
+- **Never the default** and never used to balance new agents.
+- **Credentials:** Claude Code uses the daemon host's Google Application Default Credentials. Run `gcloud auth application-default login` there (or set `GOOGLE_APPLICATION_CREDENTIALS`) and enable the Claude models in Vertex AI Model Garden for the project. Until credentials exist, the account shows as signed out.
+- Sessions on Vertex run with `CLAUDE_CODE_USE_VERTEX=1`, `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`, on your CLI login's home, so settings, skills, MCP servers and history stay shared.
+- Vertex bills per token and has no usage windows, so its card shows no usage bars.
+
 ## Several hosts
 
 Paseo installs plugins per host (daemon), so install ZeroSub on each host whose agents should use it. When more than one host has it, Paseo shows a single **Accounts (ZeroSub)** item with a host picker at the top.

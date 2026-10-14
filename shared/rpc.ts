@@ -31,6 +31,16 @@ export const cancelLogin = defineRpc({
   output: LoginViewSchema.nullable(),
 });
 
+export const addVertexAccount = defineRpc({
+  name: "zerosub.accounts.addVertex",
+  input: z.object({
+    projectId: z.string().trim().min(1),
+    region: z.string().trim().min(1),
+    label: z.string().trim().max(40).optional(),
+  }),
+  output: z.object({ accountId: z.string() }),
+});
+
 export const renameAccount = defineRpc({
   name: "zerosub.accounts.rename",
   input: z.object({ accountId: z.string(), label: z.string().trim().min(1).max(40) }),

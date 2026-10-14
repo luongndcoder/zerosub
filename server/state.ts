@@ -1,6 +1,6 @@
 import { copyFile } from "node:fs/promises";
 import { z } from "zod";
-import { AccountKindSchema, FamilySchema, type Family } from "../shared/model";
+import { AccountKindSchema, FamilySchema, VertexConfigSchema, type Family } from "../shared/model";
 import { Mutex, readJson, writeJsonAtomic } from "./json-file";
 import { statePath } from "./paths";
 
@@ -26,6 +26,8 @@ export const StoredAccountSchema = z.object({
   limitKind: z.enum(["window", "budget"]).nullable().default(null),
   /** When the current limit was recorded. */
   limitedAt: z.string().nullable().default(null),
+  /** Project and region for a `vertex` account; `null` for subscription accounts. */
+  vertex: VertexConfigSchema.nullable().default(null),
   createdAt: z.string(),
 });
 export type StoredAccount = z.infer<typeof StoredAccountSchema>;
@@ -165,11 +167,14 @@ export function accountsOf(state: StoredState, family: Family): StoredAccount[] 
   return state.accounts.filter((account) => account.family === family);
 }
 
-/** The explicit default, else the CLI's own login, else the first account. */
+/**
+ * The explicit default, else the CLI's own login, else the first subscription account. A Vertex
+ * account bills per use, so it is never the default.
+ */
 export function defaultAccount(state: StoredState, family: Family): StoredAccount | undefined {
   const chosen = findAccount(state, state.defaults[family]);
-  if (chosen && chosen.family === family) return chosen;
-  const accounts = accountsOf(state, family);
+  if (chosen && chosen.family === family && chosen.kind !== "vertex") return chosen;
+  const accounts = accountsOf(state, family).filter((account) => account.kind !== "vertex");
   return accounts.find((account) => account.kind === "main") ?? accounts[0];
 }
 

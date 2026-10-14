@@ -395,3 +395,92 @@ describe("disabling an account", () => {
     expect(reopened).toHaveLength(2);
   });
 });
+
+describe("Vertex AI fallback", () => {
+  const VERTEX = "claude-vertex-test";
+  const vertexAccount = {
+    id: VERTEX,
+    family: "claude" as const,
+    label: "vertex",
+    kind: "vertex" as const,
+    home: null,
+    vertex: { projectId: "my-project-123", region: "global" },
+    createdAt: "2026-09-23T00:00:00.000Z",
+  };
+  const doneTurn = (service: Service, context: unknown) =>
+    service.onTurnEnded(
+      { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "completed" }, timeline: [] } as never,
+      context as never,
+    );
+  const openEnv = async (service: Service, paseo: unknown) =>
+    (
+      await service.onSessionOpen(
+        { agentId: AGENT, provider: "claude", reason: "refresh", purpose: "interactive", env: {} } as never,
+        { paseo } as never,
+      )
+    )?.env;
+
+  it("moves the agent to Vertex in place once every subscription account is out", async () => {
+    const { service, store, reopened, notes, paseo, limitTurn } = await setUp(
+      { accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never, defaults: { claude: MAIN, codex: null }, sessions: {} },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: VERTEX, source: "auto" });
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "vertex", outcome: "switched" });
+    expect(await openEnv(service, paseo)).toMatchObject({
+      CLAUDE_CODE_USE_VERTEX: "1",
+      ANTHROPIC_VERTEX_PROJECT_ID: "my-project-123",
+      CLOUD_ML_REGION: "global",
+    });
+  });
+
+  it("prefers another subscription account over Vertex", async () => {
+    const { store, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), vertexAccount, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null },
+        sessions: {},
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
+    );
+    await limitTurn();
+    expect((await store.read()).bindings[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ to: "hello" });
+  });
+
+  it("returns to a subscription account after a turn once one has room again", async () => {
+    const at = new Date().toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inPast() }, vertexAccount] as never,
+        defaults: { claude: MAIN, codex: null },
+        bindings: { [AGENT]: { accountId: VERTEX, source: "auto", at } },
+        sessions: { [AGENT]: { accountId: VERTEX, family: "claude", openedAt: at } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    await doneTurn(service, { paseo });
+    expect((await store.read()).bindings[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "vertex", to: "marketing", outcome: "switched" });
+  });
+
+  it("leaves an agent the user put on Vertex where it is", async () => {
+    const at = new Date().toISOString();
+    const { service, store, reopened, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never,
+        defaults: { claude: MAIN, codex: null },
+        bindings: { [AGENT]: { accountId: VERTEX, source: "user", at } },
+        sessions: { [AGENT]: { accountId: VERTEX, family: "claude", openedAt: at } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    await doneTurn(service, { paseo });
+    expect((await store.read()).bindings[AGENT]?.accountId).toBe(VERTEX);
+    expect(reopened).toEqual([]);
+  });
+});

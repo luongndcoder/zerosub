@@ -57,14 +57,15 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
   let signature = "";
   const syncDynamic = () => {
     const state = store.current.state;
-    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status])) : "";
+    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, a.kind])) : "";
     if (next === signature) return;
     signature = next;
     for (const remove of dynamic) remove();
     dynamic = [];
     if (!state) return;
     state.accounts.forEach((account, index) => {
-      if (account.isDefault || account.status === "signed_out" || account.status === "disabled") return;
+      // A Vertex account bills per use and can't be the default.
+      if (account.isDefault || account.kind === "vertex" || account.status === "signed_out" || account.status === "disabled") return;
       dynamic.push(
         client.addCommandCenterItem({
           id: `default-${index}`,

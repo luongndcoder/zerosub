@@ -9,6 +9,7 @@ import {
   getState,
   redeemReset,
   removeAccount,
+  addVertexAccount,
   renameAccount,
   setAgentAccount,
   setDefaultAccount,
@@ -68,6 +69,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(startLogin, ({ family, method, accountId }) => service.startLogin(family, method, accountId));
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
+  server.handle(addVertexAccount, async (input) => ({ accountId: await service.addVertexAccount(input) }));
   server.handle(renameAccount, async ({ accountId, label }) => {
     await service.rename(accountId, label);
     return { ok: true as const };

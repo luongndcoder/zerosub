@@ -53,8 +53,20 @@ export const AccountKindSchema = z.enum([
   "main",
   /** Created by this plugin: an isolated credential home that shares everything else with main. */
   "managed",
+  /**
+   * Claude Code on Google Vertex AI, billed per use through a GCP project. Never the default and
+   * never balanced onto: only a fallback once every subscription account is out.
+   */
+  "vertex",
 ]);
 export type AccountKind = z.infer<typeof AccountKindSchema>;
+
+export const VertexConfigSchema = z.object({
+  projectId: z.string(),
+  /** `CLOUD_ML_REGION`, e.g. `global`, `us-east5`, `europe-west1`. */
+  region: z.string(),
+});
+export type VertexConfig = z.infer<typeof VertexConfigSchema>;
 
 /** `disabled`: the user set it aside for a while; it stays signed in but nothing is routed to it. */
 export const AccountStatusSchema = z.enum(["ready", "signed_out", "limited", "checking", "disabled"]);
@@ -74,6 +86,7 @@ export const AccountViewSchema = z.object({
   usage: UsageSchema.nullable(),
   agentCount: z.number(),
   home: z.string().nullable(),
+  vertex: VertexConfigSchema.nullable().default(null),
 });
 export type AccountView = z.infer<typeof AccountViewSchema>;
 

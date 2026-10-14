@@ -21,6 +21,8 @@ function cause(row: SwitchRow): string | null {
       return `${row.to} is enabled again.`;
     case "default":
       return "The default account changed.";
+    case "returned":
+      return `${row.to} has room again, so this agent leaves pay-per-use Vertex AI.`;
     default:
       return null;
   }

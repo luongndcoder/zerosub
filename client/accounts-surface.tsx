@@ -15,6 +15,7 @@ import {
   type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { AddVertexAccountModal } from "./add-vertex-account";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, UsageBar, useText } from "./ui";
@@ -26,6 +27,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   const { state, error } = useStore(store);
   const text = useText(theme);
   const [adding, setAdding] = useState<{ family: Family; accountId?: string } | null>(null);
+  const [addingVertex, setAddingVertex] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const refreshUsage = useCallback(async () => {
     setRefreshing(true);
@@ -119,6 +121,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
                 compact={layout.compact}
                 store={store}
                 onAdd={() => setAdding({ family })}
+                onAddVertex={family === "claude" ? () => setAddingVertex(true) : undefined}
                 onSignIn={(account) => setAdding({ family, accountId: account.id })}
               />
             ))
@@ -127,6 +130,15 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
         <AutomationSettings theme={theme} />
       </ScrollView>
 
+      {addingVertex ? (
+        <AddVertexAccountModal
+          theme={theme}
+          host={host}
+          multiHost={multiHost}
+          store={store}
+          onClose={() => setAddingVertex(false)}
+        />
+      ) : null}
       {adding ? (
         <AddAccountModal
           theme={theme}
@@ -179,6 +191,7 @@ function FamilySection({
   compact,
   store,
   onAdd,
+  onAddVertex,
   onSignIn,
 }: {
   family: Family;
@@ -187,6 +200,8 @@ function FamilySection({
   compact: boolean;
   store: ZeroSubStore;
   onAdd(): void;
+  /** Claude only: add the pay-per-use Vertex AI fallback. */
+  onAddVertex?(): void;
   onSignIn(account: AccountView): void;
 }) {
   const text = useText(theme);
@@ -196,15 +211,28 @@ function FamilySection({
         <Text style={text.heading} accessibilityRole="header">
           {family === "claude" ? "Claude" : "ChatGPT (Codex)"}
         </Text>
-        <Button
-          theme={theme}
-          icon="Plus"
-          label={compact ? "Add" : "Add account"}
-          accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
-          tooltip={`Sign in another ${FAMILY_LABEL[family]} account`}
-          tooltipAlign="end"
-          onPress={onAdd}
-        />
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          {onAddVertex ? (
+            <Button
+              theme={theme}
+              icon="Cloud"
+              label={compact ? "Vertex" : "Vertex AI"}
+              accessibilityLabel="Add Vertex AI fallback"
+              tooltip="Pay-per-use fallback for when every Claude account is out"
+              tooltipAlign="end"
+              onPress={onAddVertex}
+            />
+          ) : null}
+          <Button
+            theme={theme}
+            icon="Plus"
+            label={compact ? "Add" : "Add account"}
+            accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
+            tooltip={`Sign in another ${FAMILY_LABEL[family]} account`}
+            tooltipAlign="end"
+            onPress={onAdd}
+          />
+        </View>
       </View>
       {accounts.length === 0 ? (
         <Text style={text.muted}>No {FAMILY_LABEL[family]} accounts yet.</Text>
@@ -250,6 +278,7 @@ function AccountCard({
   const subtitle = accountSubtitle(account);
   const signedOut = account.status === "signed_out";
   const disabled = account.status === "disabled";
+  const vertex = account.kind === "vertex";
   const faded = disabled ? { opacity: 0.55 } : null;
   const windows = account.usage?.windows ?? [];
   const agents = account.agentCount === 0 ? "No agents" : `${account.agentCount} agent${account.agentCount === 1 ? "" : "s"}`;
@@ -346,7 +375,7 @@ function AccountCard({
               onPress={() => void markAvailable()}
             />
           ) : null}
-          {!account.isDefault && !signedOut && !disabled ? (
+          {!account.isDefault && !signedOut && !disabled && !vertex ? (
             <IconButton
               theme={theme}
               icon="Star"
@@ -374,7 +403,7 @@ function AccountCard({
               theme={theme}
               icon="Trash2"
               label="Remove"
-              tooltip="Remove: sign it out and delete its saved login"
+              tooltip={vertex ? "Remove this Vertex AI fallback" : "Remove: sign it out and delete its saved login"}
               tone="danger"
               busy={busy === "remove"}
               onPress={() => setConfirmRemove(true)}
@@ -388,14 +417,23 @@ function AccountCard({
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
         {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
+        {vertex ? <Badge theme={theme} label="Fallback" tone="warning" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
         {resets && !signedOut ? <Badge theme={theme} label={resetBadge(resets)} tone="accent" /> : null}
       </View>
 
       <View style={[{ gap: 10 }, faded]}>
-        {signedOut ? (
+        {signedOut && vertex ? (
+          <Text style={text.small}>
+            No Google credentials on the daemon host. Run gcloud auth application-default login there.
+          </Text>
+        ) : signedOut ? (
           <Text style={text.small}>Sign in again to use this account.</Text>
+        ) : vertex ? (
+          <Text style={text.small}>
+            Used only when every Claude subscription account is out; agents move back once one has room.
+          </Text>
         ) : windows.length > 0 ? (
           windows.map((limit) => <UsageBar key={limit.id} theme={theme} limit={limit} />)
         ) : (
@@ -424,7 +462,7 @@ function AccountCard({
         <Text style={[text.small, { flexShrink: 1 }]} numberOfLines={1}>
           {disabled ? "Disabled · agents won't use it" : freshness ? `${agents} · ${freshness}` : agents}
         </Text>
-        {signedOut ? (
+        {signedOut && !vertex ? (
           <Button
             theme={theme}
             size="small"
