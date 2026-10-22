@@ -50,7 +50,7 @@ function describe(error: unknown): string {
 }
 
 /** Variables that would make a routed session use something other than its account's own login. */
-const OVERRIDING_AUTH = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
+export const OVERRIDING_AUTH = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
 
 export class ClaudeAdapter implements FamilyAdapter {
   readonly family = "claude" as const;

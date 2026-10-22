@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Usage } from "../shared/model";
 import { applyEnv } from "./adapter";
 import { chooseAccount, mostAvailable } from "./routing";
-import { emptyState, type StoredAccount, type StoredState } from "./state";
+import { defaultAccount, emptyState, type StoredAccount, type StoredState } from "./state";
 
 const NOW = Date.parse("2026-09-23T12:00:00Z");
 
@@ -22,6 +22,7 @@ function account(partial: Partial<StoredAccount> & Pick<StoredAccount, "id">): S
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    vertex: null,
     createdAt: "2026-09-01T00:00:00Z",
     ...partial,
   };
@@ -62,13 +63,13 @@ describe("chooseAccount", () => {
   });
 
   it("follows the chosen default", () => {
-    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, opencode: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 
   it("prefers the agent's own binding over the default", () => {
     const state = stateWith([main, work, personal], {
-      defaults: { claude: "claude-work", codex: null },
+      defaults: { claude: "claude-work", codex: null, opencode: null },
       bindings: { "agent-1": { accountId: "claude-personal", source: "user", at: "x" } },
     });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-personal");
@@ -83,7 +84,7 @@ describe("chooseAccount", () => {
 
   it("skips an exhausted account for the roomiest usable one", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
-    const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null, opencode: null } });
     const decision = chooseAccount(state, {
       ...base,
       reason: "resume",
@@ -96,14 +97,14 @@ describe("chooseAccount", () => {
 
   it("keeps an exhausted account when automatic switching is off", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
-    const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, limited], { defaults: { claude: "claude-work", codex: null, opencode: null } });
     const decision = chooseAccount(state, { ...base, autoSwitch: false, reason: "resume", usageOf: () => null });
     expect(decision?.account.id).toBe("claude-work");
   });
 
   it("treats an expired limit as usable again", () => {
     const recovered = account({ id: "claude-work", limitedUntil: "2026-09-23T11:00:00Z" });
-    const state = stateWith([main, recovered], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, recovered], { defaults: { claude: "claude-work", codex: null, opencode: null } });
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-work");
   });
 
@@ -139,7 +140,7 @@ describe("mostAvailable", () => {
   it("breaks ties toward the default account", () => {
     const main = account({ id: "claude-main", kind: "main", home: null });
     const work = account({ id: "claude-work" });
-    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null } });
+    const state = stateWith([main, work], { defaults: { claude: "claude-work", codex: null, opencode: null } });
     expect(mostAvailable(state, "claude", () => usage(20), NOW)?.id).toBe("claude-work");
   });
 
@@ -236,5 +237,57 @@ describe("disabled accounts", () => {
     const state = stateWith([main, account({ id: "claude-work", ...off })]);
     const usageOf = (id: string) => usage(id === "claude-main" ? 90 : 5);
     expect(mostAvailable(state, "claude", usageOf, NOW)?.id).toBe("claude-main");
+  });
+});
+
+describe("Vertex AI fallback routing", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const work = account({ id: "claude-work" });
+  const vertex = account({
+    id: "claude-vertex-a",
+    kind: "vertex",
+    home: null,
+    vertex: { projectId: "my-project-123", region: "global" },
+  });
+  const limited = (entry: StoredAccount) => ({ ...entry, limitedUntil: "2026-09-23T15:00:00Z" });
+
+  it("never ranks Vertex among subscription accounts, however busy they are", () => {
+    const state = stateWith([main, work, vertex]);
+    const usageOf = (id: string) => (id === "claude-vertex-a" ? null : usage(95));
+    expect(mostAvailable(state, "claude", usageOf, NOW)?.id).not.toBe("claude-vertex-a");
+    expect(mostAvailable(stateWith([limited(main), vertex]), "claude", () => null, NOW)).toBeUndefined();
+  });
+
+  it("is never the default, even when chosen or the only other account", () => {
+    expect(defaultAccount(stateWith([main, vertex], { defaults: { claude: "claude-vertex-a", codex: null, opencode: null } }), "claude")?.id).toBe(
+      "claude-main",
+    );
+    expect(defaultAccount(stateWith([vertex, work]), "claude")?.id).toBe("claude-work");
+  });
+
+  it("opens on Vertex when every subscription account is out", () => {
+    const decision = chooseAccount(stateWith([limited(main), limited(work), vertex]), {
+      ...base,
+      reason: "resume",
+      usageOf: () => null,
+    });
+    expect(decision?.account.id).toBe("claude-vertex-a");
+    expect(decision?.bind).toMatchObject({ accountId: "claude-vertex-a", source: "auto" });
+  });
+
+  it("goes back to a subscription account with room when the session reopens", () => {
+    const state = stateWith([main, vertex], {
+      bindings: { "agent-1": { accountId: "claude-vertex-a", source: "auto", at: "x" } },
+    });
+    const decision = chooseAccount(state, { ...base, reason: "resume", usageOf: () => null });
+    expect(decision?.account.id).toBe("claude-main");
+    expect(decision?.bind).toMatchObject({ accountId: "claude-main", source: "auto" });
+  });
+
+  it("keeps an agent the user put on Vertex", () => {
+    const state = stateWith([main, vertex], {
+      bindings: { "agent-1": { accountId: "claude-vertex-a", source: "user", at: "x" } },
+    });
+    expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-vertex-a");
   });
 });

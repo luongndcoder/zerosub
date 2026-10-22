@@ -26,6 +26,11 @@ export const preferences = defineSettings({
     forkOtherProvider: z.boolean().default(false),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
+    /**
+     * List every account as its own provider ("Claude · work") in the new-agent picker, so a new
+     * session starts on the account picked there.
+     */
+    accountProviders: z.boolean().default(true),
   }),
 });
 

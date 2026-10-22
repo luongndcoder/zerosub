@@ -26,7 +26,11 @@ export function headroomScore(usage: Usage | null | undefined): number {
   return peak ? peak.usedPercent : 50;
 }
 
-/** The usable account with the most room, preferring the default, then the CLI login, on ties. */
+/**
+ * The usable subscription account with the most room, preferring the default, then the CLI login,
+ * on ties. Vertex accounts are left out: they have no usage windows, so they would rank as
+ * half-used and win over busier subscriptions. `vertexFallback` picks them once nothing else is left.
+ */
 export function mostAvailable(
   state: StoredState,
   family: Family,
@@ -36,7 +40,7 @@ export function mostAvailable(
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const candidates = accountsOf(state, family).filter(
-    (account) => !exclude.has(account.id) && isUsable(account, now),
+    (account) => account.kind !== "vertex" && !exclude.has(account.id) && isUsable(account, now),
   );
   const rank = (account: StoredAccount) => [
     headroomScore(usageOf(account.id)),
@@ -54,6 +58,18 @@ export function mostAvailable(
     return 0;
   });
   return candidates[0];
+}
+
+/** A usable pay-per-use Vertex account, for when every subscription account of the family is out. */
+export function vertexFallback(
+  state: StoredState,
+  family: Family,
+  now: number,
+  exclude: ReadonlySet<string> = new Set(),
+): StoredAccount | undefined {
+  return accountsOf(state, family).find(
+    (account) => account.kind === "vertex" && !exclude.has(account.id) && isUsable(account, now),
+  );
 }
 
 export interface RouteInput {
@@ -110,11 +126,21 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   }
   if (!account) return null;
 
+  const mayMove = fresh || input.portable;
+  // An agent that fell back to Vertex goes back to a subscription as soon as one has room, unless
+  // the user put it on Vertex on purpose.
+  if (account.kind === "vertex" && binding?.source !== "user" && mayMove && input.autoSwitch) {
+    const back = mostAvailable(state, input.family, input.usageOf, input.now);
+    if (back) return { account: back, bind: { accountId: back.id, source: "auto", at }, skipped: null };
+  }
+
   let skipped: RouteDecision["skipped"] = null;
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
-  const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
-    const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+    const exclude = new Set([account.id]);
+    const alternative =
+      mostAvailable(state, input.family, input.usageOf, input.now, exclude) ??
+      vertexFallback(state, input.family, input.now, exclude);
     if (alternative) {
       skipped = { account, why };
       account = alternative;

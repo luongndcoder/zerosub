@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter, LimitHit, UsageRead } from "./adapter";
 import type { FamilyResolver } from "./families";
 import { detectClaudeLimit } from "./limits";
@@ -59,8 +59,12 @@ function fakePaseo() {
   const sent: string[] = [];
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
   const agent = { id: AGENT, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z" };
+  const patches: unknown[] = [];
   const paseo = {
-    config: { get: async () => ({ config: { providers: {} } }) },
+    config: {
+      get: async () => ({ config: { providers: {} } }),
+      patch: async (patch: unknown) => void patches.push(patch),
+    },
     agents: {
       list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
       ref: () => ({
@@ -74,7 +78,7 @@ function fakePaseo() {
       }),
     },
   };
-  return { paseo, sent, notes };
+  return { paseo, sent, notes, patches };
 }
 
 interface SetUpOptions {
@@ -109,7 +113,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
   const families = { resolve: async () => ({ claude: "claude" as const }) };
   const claude = { ...claudeAdapter(hit), ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}) };
   const service = new Service(
-    { claude, codex: claudeAdapter(hit) },
+    { claude, codex: claudeAdapter(hit), opencode: claudeAdapter(hit) },
     store,
     families as unknown as FamilyResolver,
     reopener as unknown as Reopener,
@@ -131,7 +135,7 @@ describe("failover", () => {
     const { store, reopened, sent, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: {},
       },
@@ -152,7 +156,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt, message: "You've hit your session limit" }),
@@ -169,7 +173,7 @@ describe("failover", () => {
     const { reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt: inPast(), message: "You've hit your session limit" }),
@@ -187,7 +191,7 @@ describe("failover", () => {
     const { service, store, reopened, notes, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => {
@@ -224,7 +228,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -243,7 +247,7 @@ describe("failover", () => {
     const { store, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -274,7 +278,7 @@ describe("forking to the other provider", () => {
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: [account(MAIN, "marketing", "main"), { ...account(CODEX_MAIN, "hello", "main"), family: "codex" }],
-        defaults: { claude: MAIN, codex: CODEX_MAIN },
+        defaults: { claude: MAIN, codex: CODEX_MAIN, opencode: null },
       }),
     );
     const source = {
@@ -322,6 +326,7 @@ describe("forking to the other provider", () => {
       {
         claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" })),
         codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        opencode: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "opencode" } as FamilyAdapter,
       },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
@@ -372,7 +377,7 @@ describe("disabling an account", () => {
     const { service, store, reopened } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
       },
@@ -393,5 +398,124 @@ describe("disabling an account", () => {
     state = await store.read();
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
     expect(reopened).toHaveLength(2);
+  });
+});
+
+describe("Vertex AI fallback", () => {
+  const VERTEX = "claude-vertex-test";
+  const vertexAccount = {
+    id: VERTEX,
+    family: "claude" as const,
+    label: "vertex",
+    kind: "vertex" as const,
+    home: null,
+    vertex: { projectId: "my-project-123", region: "global" },
+    createdAt: "2026-09-23T00:00:00.000Z",
+  };
+  const doneTurn = (service: Service, context: unknown) =>
+    service.onTurnEnded(
+      { agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "completed" }, timeline: [] } as never,
+      context as never,
+    );
+  const openEnv = async (service: Service, paseo: unknown) =>
+    (
+      await service.onSessionOpen(
+        { agentId: AGENT, provider: "claude", reason: "refresh", purpose: "interactive", env: {} } as never,
+        { paseo } as never,
+      )
+    )?.env;
+
+  it("moves the agent to Vertex in place once every subscription account is out", async () => {
+    const { service, store, reopened, notes, paseo, limitTurn } = await setUp(
+      { accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never, defaults: { claude: MAIN, codex: null, opencode: null }, sessions: {} },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: VERTEX, source: "auto" });
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "marketing", to: "vertex", outcome: "switched" });
+    expect(await openEnv(service, paseo)).toMatchObject({
+      CLAUDE_CODE_USE_VERTEX: "1",
+      ANTHROPIC_VERTEX_PROJECT_ID: "my-project-123",
+      CLOUD_ML_REGION: "global",
+    });
+  });
+
+  it("prefers another subscription account over Vertex", async () => {
+    const { store, notes, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), vertexAccount, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, opencode: null },
+        sessions: {},
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
+    );
+    await limitTurn();
+    expect((await store.read()).bindings[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ to: "hello" });
+  });
+
+  it("returns to a subscription account after a turn once one has room again", async () => {
+    const at = new Date().toISOString();
+    const { service, store, reopened, notes, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inPast() }, vertexAccount] as never,
+        defaults: { claude: MAIN, codex: null, opencode: null },
+        bindings: { [AGENT]: { accountId: VERTEX, source: "auto", at } },
+        sessions: { [AGENT]: { accountId: VERTEX, family: "claude", openedAt: at } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    await doneTurn(service, { paseo });
+    expect((await store.read()).bindings[AGENT]?.accountId).toBe(MAIN);
+    expect(reopened).toEqual([AGENT]);
+    expect(notes.at(-1)).toMatchObject({ from: "vertex", to: "marketing", outcome: "switched" });
+  });
+
+  it("leaves an agent the user put on Vertex where it is", async () => {
+    const at = new Date().toISOString();
+    const { service, store, reopened, paseo } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never,
+        defaults: { claude: MAIN, codex: null, opencode: null },
+        bindings: { [AGENT]: { accountId: VERTEX, source: "user", at } },
+        sessions: { [AGENT]: { accountId: VERTEX, family: "claude", openedAt: at } },
+      },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    await doneTurn(service, { paseo });
+    expect((await store.read()).bindings[AGENT]?.accountId).toBe(VERTEX);
+    expect(reopened).toEqual([]);
+  });
+});
+
+describe("per-account providers", () => {
+  it("starts a new agent picked as \"Claude · hello\" on hello, pinned there", async () => {
+    const { service, store, paseo } = await setUp(
+      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null, opencode: null } },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    const opened = await service.onSessionOpen(
+      { agentId: AGENT, provider: `zs-${HELLO}`, reason: "create", purpose: "interactive", env: {} } as never,
+      { paseo } as never,
+    );
+    expect(opened?.env).toMatchObject({ CLAUDE_CONFIG_DIR: join(tmpdir(), HELLO) });
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "user" });
+  });
+
+  it("adds one provider profile per account to the daemon config", async () => {
+    const { service, paseo, patches } = await setUp(
+      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null, opencode: null } },
+      () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
+    );
+    service.attach(paseo as never);
+    await vi.waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]).toEqual({
+      providers: {
+        [`zs-${MAIN}`]: { extends: "claude", label: "Claude · marketing", description: "ZeroSub: new agents start on marketing" },
+        [`zs-${HELLO}`]: { extends: "claude", label: "Claude · hello", description: "ZeroSub: new agents start on hello" },
+      },
+    });
   });
 });

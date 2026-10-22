@@ -12,7 +12,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
       id: "open-accounts",
       title: "Manage subscription accounts (ZeroSub)",
       icon: "Users",
-      keywords: ["zerosub", "claude", "chatgpt", "codex", "account", "subscription", "login", "switch"],
+      keywords: ["zerosub", "claude", "chatgpt", "codex", "opencode", "account", "subscription", "login", "switch"],
       context: "global",
       onSelect({ openSurface }) {
         openSurface("accounts");
@@ -29,7 +29,7 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
       async onSubmit({ args, agent, openSurface }) {
         const state = await currentState(store);
         const family = state.providers[agent.provider];
-        if (!family) throw new Error(`${agent.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+        if (!family) throw new Error(`${agent.provider} agents don't use Claude, ChatGPT or OpenCode accounts.`);
         const query = args.trim();
         if (!query) {
           openSurface("accounts");
@@ -57,14 +57,15 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
   let signature = "";
   const syncDynamic = () => {
     const state = store.current.state;
-    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status])) : "";
+    const next = state ? JSON.stringify(state.accounts.map((a) => [a.id, a.label, a.isDefault, a.status, a.kind])) : "";
     if (next === signature) return;
     signature = next;
     for (const remove of dynamic) remove();
     dynamic = [];
     if (!state) return;
     state.accounts.forEach((account, index) => {
-      if (account.isDefault || account.status === "signed_out" || account.status === "disabled") return;
+      // A Vertex account bills per use and can't be the default.
+      if (account.isDefault || account.kind === "vertex" || account.status === "signed_out" || account.status === "disabled") return;
       dynamic.push(
         client.addCommandCenterItem({
           id: `default-${index}`,

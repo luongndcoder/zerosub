@@ -30,17 +30,27 @@ import {
   type RedeemReply,
   type UsageRead,
 } from "./adapter";
+import { accountForProvider, desiredAccountProviders, syncAccountProviders } from "./account-providers";
 import { FamilyResolver } from "./families";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
 import { removeHome } from "./homes";
 import { Mutex } from "./json-file";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
+import {
+  credentialFingerprint,
+  planOf,
+  verifyGoKey,
+  writeCredentials,
+  writeMainCredentials,
+  type OpenCodeCredentials,
+} from "./opencode";
 import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, saveReadings, showLimit } from "./usage";
-import { chooseAccount, isLimited, mostAvailable } from "./routing";
+import { validateVertexConfig, vertexEnv, vertexIdentity, vertexUsage } from "./vertex";
+import { chooseAccount, isLimited, mostAvailable, vertexFallback } from "./routing";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -55,9 +65,9 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const FAMILIES: readonly Family[] = ["claude", "codex"];
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex" };
-const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" };
+const FAMILIES: readonly Family[] = ["claude", "codex", "opencode"];
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude", opencode: "opencode" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -88,6 +98,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   showComposerPill: true,
   autoRedeem: false,
   forkOtherProvider: false,
+  accountProviders: true,
 };
 
 interface LoginSession {
@@ -135,7 +146,11 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = {
+    claude: new Mutex(),
+    codex: new Mutex(),
+    opencode: new Mutex(),
+  };
   /** Agents whose account changed mid-turn; reopened when the turn ends. */
   private readonly deferred = new Map<string, SwitchRow | null>();
   /** Agents in the middle of a failover, so nothing else moves them at the same time. */
@@ -168,11 +183,36 @@ export class Service {
 
   setPreferences(prefs: Preferences): void {
     this.prefs = prefs;
+    this.requestProviderSync();
   }
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
   attach(paseo: PaseoApi): void {
-    this.paseo ??= paseo;
+    if (this.paseo) return;
+    this.paseo = paseo;
+    this.requestProviderSync();
+  }
+
+  private readonly providerSyncLock = new Mutex();
+  /** What the provider profiles were last made to match, so unchanged accounts cost no config read. */
+  private providerSyncKey: string | null = null;
+
+  /** Keeps one provider profile per account in the daemon config ("Claude · work"). */
+  private requestProviderSync(): void {
+    const paseo = this.paseo;
+    if (!paseo) return;
+    void this.providerSyncLock
+      .run(async () => {
+        const state = await this.store.read();
+        const key = JSON.stringify(desiredAccountProviders(state, this.prefs.accountProviders));
+        if (key === this.providerSyncKey) return;
+        if (await syncAccountProviders(paseo, state, this.prefs.accountProviders)) {
+          this.families.invalidate?.();
+          console.log("[ZeroSub] updated the per-account providers");
+        }
+        this.providerSyncKey = key;
+      })
+      .catch((error: unknown) => log("could not update the per-account providers", error));
   }
 
   async start(): Promise<void> {
@@ -243,13 +283,18 @@ export class Service {
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
     if (this.paseo) await this.collectOrphanHomes(this.paseo);
+    // Catches accounts added, renamed or removed elsewhere (another client, identity updates).
+    this.requestProviderSync();
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
     this.identityCheckedAt.set(accountId, Date.now());
     const account = findAccount(await this.store.read(), accountId);
     if (!account) return;
-    const identity = await this.adapters[account.family].identity(account.home).catch(() => null);
+    const identity =
+      account.kind === "vertex" && account.vertex
+        ? vertexIdentity(account.vertex)
+        : await this.adapters[account.family].identity(account.home).catch(() => null);
     if (!identity) return;
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
@@ -295,7 +340,13 @@ export class Service {
       }
       for (const name of names) {
         const home = join(root, name);
-        const family: Family | null = name.startsWith("claude-") ? "claude" : name.startsWith("codex-") ? "codex" : null;
+        const family: Family | null = name.startsWith("claude-")
+          ? "claude"
+          : name.startsWith("codex-")
+            ? "codex"
+            : name.startsWith("opencode-")
+              ? "opencode"
+              : null;
         if (!family || owned.has(home)) continue;
         // A managed account's ID is its home's folder name, so sessions still name it after removal.
         const users = Object.entries(state.sessions)
@@ -341,11 +392,18 @@ export class Service {
     context: PluginHookContext,
   ): Promise<PluginSessionOpenRequest | undefined> {
     this.attach(context.paseo);
-    const family = (await this.families.resolve(context.paseo))[request.provider];
+    const now = Date.now();
+    let state = await this.store.read();
+    // Picked as "Claude · work" in the new-agent picker: the session starts on that account.
+    const picked = accountForProvider(state, request.provider);
+    const family = picked?.family ?? (await this.families.resolve(context.paseo))[request.provider];
     if (!family) return undefined;
     const adapter = this.adapters[family];
-    const now = Date.now();
-    const state = await this.store.read();
+    if (picked && request.reason === "create" && !state.bindings[request.agentId]) {
+      state = await this.store.update((draft) => {
+        draft.bindings[request.agentId] ??= { accountId: picked.id, source: "user", at: new Date(now).toISOString() };
+      });
+    }
     const decision = chooseAccount(state, {
       agentId: request.agentId,
       family,
@@ -383,7 +441,8 @@ export class Service {
         decision.skipped ? `; skipped ${decision.skipped.account.label}: ${decision.skipped.why}` : ""
       })`,
     );
-    return { ...request, env: applyEnv(await adapter.env(account.home), request.env) };
+    const patch = account.kind === "vertex" && account.vertex ? vertexEnv(account.vertex) : await adapter.env(account.home);
+    return { ...request, env: applyEnv(patch, request.env) };
   }
 
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */
@@ -411,6 +470,7 @@ export class Service {
       }
     }
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
+    else if (await this.returnFromVertex(context.paseo, agentId, family)) return;
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
   }
@@ -423,6 +483,41 @@ export class Service {
     await this.store.update((draft) => {
       delete draft.sessions[agentId];
     });
+  }
+
+  /**
+   * Vertex bills per use, so an agent that fell back to it moves back to a subscription account as
+   * soon as one has room, between turns. One the user put on Vertex themselves stays there.
+   */
+  private async returnFromVertex(paseo: PaseoApi, agentId: string, family: Family): Promise<boolean> {
+    if (!this.prefs.autoSwitch || !this.adapters[family].portable) return false;
+    const state = await this.store.read();
+    const current = findAccount(state, this.runningOn(state, agentId, family));
+    if (current?.kind !== "vertex" || state.bindings[agentId]?.source === "user") return false;
+    const now = Date.now();
+    const back = mostAvailable(state, family, (id) => this.usage.get(id), now);
+    if (!back || !this.switchGuard.allows(agentId, now)) return false;
+    const at = new Date(now).toISOString();
+    await this.store.update((draft) => {
+      draft.bindings[agentId] = { accountId: back.id, source: "auto", at };
+    });
+    this.switchGuard.note(agentId, now);
+    const outcome = await this.reopenAgent(paseo, agentId, null, true);
+    const row: SwitchRow = {
+      family,
+      from: current.label,
+      to: back.label,
+      reason: "returned",
+      resetsAt: null,
+      continued: false,
+      continuedIn: null,
+      toFamily: null,
+      outcome: outcome === "reopened" ? "switched" : "pending",
+      detail: null,
+      at,
+    };
+    await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+    return true;
   }
 
   /** Re-checks the account an agent was using; true when it really is signed out now. */
@@ -553,7 +648,7 @@ export class Service {
       }
       return;
     }
-    const next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    let next = mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -593,9 +688,13 @@ export class Service {
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
+      // Every subscription is out and no reset helped: carry on, in place, on pay-per-use Vertex.
+      next = adapter.portable ? vertexFallback(latest, family, now, new Set([account.id])) : undefined;
+    }
+    if (!next) {
       if (reason !== "limit") return;
       let detail: string | null = null;
-      if (this.prefs.forkOtherProvider) {
+      if (this.prefs.forkOtherProvider && family !== "opencode") {
         // Opt-in: every account of this provider is out, so carry on with the other provider.
         const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto").catch((error: unknown) => ({
           skipped: `Couldn't continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
@@ -615,7 +714,7 @@ export class Service {
         }
         console.log(`[ZeroSub] not continuing ${agentId} on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${result.skipped}`);
         detail = result.skipped;
-      } else if (mostAvailable(latest, OTHER_FAMILY[family], (id) => this.usage.get(id), now, new Set())) {
+      } else if (family !== "opencode" && mostAvailable(latest, OTHER_FAMILY[family], (id) => this.usage.get(id), now, new Set())) {
         detail = `Or continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]} in a new agent from the account button.`;
       }
       await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
@@ -881,6 +980,9 @@ export class Service {
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
   ): Promise<{ fork: Continuation; account: StoredAccount; family: Family } | { skipped: string }> {
+    if (family === "opencode") {
+      return { skipped: "OpenCode conversations don't carry on to another provider." };
+    }
     const other = OTHER_FAMILY[family];
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
@@ -944,7 +1046,10 @@ export class Service {
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT or OpenCode accounts.`);
+    if (family === "opencode") {
+      throw new Error("OpenCode conversations don't carry on to another provider.");
+    }
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
@@ -1138,6 +1243,10 @@ export class Service {
     const task = (async () => {
       const account = findAccount(await this.store.read(), accountId);
       if (!account) return;
+      if (account.kind === "vertex") {
+        this.setUsage(accountId, vertexUsage());
+        return;
+      }
       const spacing = this.adapters[account.family].usageSpacingMs;
       if (since < (force ? spacing : Math.max(spacing, 60_000))) return;
       this.usageAttemptAt.set(accountId, Date.now());
@@ -1236,6 +1345,7 @@ export class Service {
         usage: this.usage.get(account.id) ?? null,
         agentCount: counts.get(account.id) ?? 0,
         home: account.home,
+        vertex: account.vertex,
       };
     });
 
@@ -1303,6 +1413,9 @@ export class Service {
     if (!account) throw new Error("That account no longer exists.");
     if (!account.signedIn) throw new Error(`${account.label} is signed out. Sign it in first.`);
     if (account.disabled) throw new Error(`${account.label} is disabled. Enable it before making it the default.`);
+    if (account.kind === "vertex") {
+      throw new Error(`${account.label} bills per use, so it is only used once every subscription account is out.`);
+    }
     if (!this.adapters[account.family].portable) await this.pinThreads(paseo, account.family);
     await this.store.update((draft) => {
       draft.defaults[account.family] = account.id;
@@ -1323,7 +1436,9 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.disabled === !enabled) return { ...emptySummary(), stayed: 0 };
-    if (!enabled && !accountsOf(state, account.family).some((other) => other.id !== account.id && other.signedIn && !other.disabled)) {
+    const inUse = (other: StoredAccount) =>
+      other.id !== account.id && other.kind !== "vertex" && other.signedIn && !other.disabled;
+    if (!enabled && account.kind !== "vertex" && !accountsOf(state, account.family).some(inUse)) {
       // With nothing else to route to, sessions would quietly fall back to the CLI login.
       throw new Error(`${account.label} is the only ${FAMILY_LABEL[account.family]} account in use. Add or enable another one first.`);
     }
@@ -1382,7 +1497,7 @@ export class Service {
     const info = await agentInfo(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT or OpenCode accounts.`);
     const adapter = this.adapters[family];
     const state = await this.store.read();
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
@@ -1430,6 +1545,127 @@ export class Service {
     return this.reconcile(paseo, "manual", [agentId]);
   }
 
+  /**
+   * Adds Claude on Vertex AI as a pay-per-use fallback. There is no sign-in: Claude Code uses the
+   * machine's Google Application Default Credentials, so the account reads as signed out until
+   * `gcloud auth application-default login` has been run on the daemon host.
+   */
+  async addVertexAccount(input: { projectId: string; region: string; label?: string }): Promise<string> {
+    const config = validateVertexConfig(input);
+    const identity = vertexIdentity(config);
+    const id = `claude-vertex-${randomBytes(6).toString("hex")}`;
+    await this.store.update((draft) => {
+      if (draft.accounts.some((account) => account.identity === identity.identity)) {
+        throw new Error(`Vertex AI for ${config.projectId} in ${config.region} is already added.`);
+      }
+      const account = newAccount({ id, family: "claude", kind: "vertex", home: null });
+      account.vertex = config;
+      applyIdentity(account, identity, draft);
+      account.label = input.label?.trim() || `Vertex · ${config.projectId}`;
+      account.autoLabel = false;
+      draft.accounts.push(account);
+    });
+    console.log(`[ZeroSub] added Vertex AI fallback ${config.projectId} (${config.region})`);
+    this.requestProviderSync();
+    return id;
+  }
+
+  /**
+   * Adds an OpenCode account, or replaces the keys of one that is already added. OpenCode signs in
+   * with API keys rather than a browser flow, so the keys are stored in the account's own home and
+   * handed to OpenCode through the environment when a session opens.
+   */
+  async addOpenCodeAccount(input: {
+    label?: string;
+    goKey?: string;
+    zenKey?: string;
+    otherProvider?: string;
+    otherKey?: string;
+    /** Replace the keys of this account instead of adding a new one. */
+    accountId?: string;
+  }): Promise<string> {
+    const credentials: OpenCodeCredentials = {};
+    const goKey = input.goKey?.trim();
+    const zenKey = input.zenKey?.trim();
+    const otherProvider = input.otherProvider?.trim();
+    const otherKey = input.otherKey?.trim();
+    if (goKey) credentials["opencode-go"] = { type: "api", key: goKey };
+    if (zenKey) credentials["opencode"] = { type: "api", key: zenKey };
+    if (otherProvider && otherKey) credentials[otherProvider] = { type: "api", key: otherKey };
+    if (otherProvider && !otherKey) throw new Error(`Add the API key for ${otherProvider}, or clear its name.`);
+    if (Object.keys(credentials).length === 0) throw new Error("Paste at least one API key.");
+    // OpenCode Go is the only provider that can be checked before the account is added.
+    if (goKey) await verifyGoKey(goKey);
+
+    const state = await this.store.read();
+    const existing = input.accountId ? findAccount(state, input.accountId) : undefined;
+    if (input.accountId && (!existing || existing.family !== "opencode")) {
+      throw new Error("That account no longer exists.");
+    }
+    const fingerprint = credentialFingerprint(credentials);
+    const duplicate = accountsOf(state, "opencode").find(
+      (account) => account.id !== existing?.id && account.identity === fingerprint,
+    );
+    if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
+
+    const identity = {
+      signedIn: true,
+      email: null,
+      plan: planOf(credentials),
+      organization: null,
+      identity: fingerprint,
+    };
+    if (existing?.kind === "main") {
+      // The user's own login: the new key replaces the old one in their OpenCode auth file, so
+      // the OpenCode CLI itself uses it too.
+      await writeMainCredentials(credentials);
+      await this.store.update((draft) => {
+        const account = findAccount(draft, existing.id);
+        if (!account) return;
+        applyIdentity(account, identity, draft);
+        account.limitedUntil = null;
+        account.limitKind = null;
+      });
+      console.log(`[ZeroSub] updated the OpenCode login for ${existing.label}`);
+      this.identityCheckedAt.set(existing.id, Date.now());
+      void this.refreshUsage(existing.id, true).catch(() => undefined);
+      return existing.id;
+    }
+    let accountId = existing?.id;
+    if (!existing) {
+      accountId = `opencode-${randomBytes(6).toString("hex")}`;
+      const home = join(homesDir(), accountId);
+      await this.adapters.opencode.prepareHome(home);
+      await writeCredentials(home, credentials);
+      await this.store.update((draft) => {
+        const account = newAccount({ id: accountId as string, family: "opencode", kind: "managed", home });
+        applyIdentity(account, identity, draft);
+        if (input.label?.trim()) {
+          account.label = input.label.trim();
+          account.autoLabel = false;
+        }
+        draft.accounts.push(account);
+      });
+    } else if (existing.home) {
+      await writeCredentials(existing.home, credentials);
+      await this.store.update((draft) => {
+        const account = findAccount(draft, existing.id);
+        if (!account) return;
+        applyIdentity(account, identity, draft);
+        account.limitedUntil = null;
+        account.limitKind = null;
+      });
+    } else {
+      throw new Error("That account has no saved keys.");
+    }
+    if (!accountId) throw new Error("That account could not be saved.");
+    this.identityCheckedAt.set(accountId, Date.now());
+    void this.refreshUsage(accountId, true).catch(() => undefined);
+    this.requestProviderSync();
+    console.log(`[ZeroSub] saved the OpenCode account ${accountId}`);
+    return accountId;
+  }
+
   async rename(accountId: string, label: string): Promise<void> {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
@@ -1438,6 +1674,7 @@ export class Service {
       account.autoLabel = false;
     });
     if (!findAccount(state, accountId)) throw new Error("That account no longer exists.");
+    this.requestProviderSync();
   }
 
   async remove(paseo: PaseoApi, accountId: string): Promise<number> {
@@ -1446,7 +1683,9 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout` or `codex logout` instead.");
+      throw new Error(
+        "Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout` or `opencode auth logout` instead.",
+      );
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
@@ -1481,6 +1720,7 @@ export class Service {
     // cleanup pass only once nothing runs on it any more.
     await this.reconcile(paseo, "removed", affected, new Map([[account.id, account.label]]));
     void this.collectOrphanHomes(paseo).catch((error: unknown) => log("cleanup failed", error));
+    this.requestProviderSync();
     return affected.length;
   }
 
@@ -1623,6 +1863,7 @@ export class Service {
     session.accountId = accountId;
     session.view = { ...session.view, step: "done", accountId, message: null };
     if (accountId) void this.refreshUsage(accountId, true).catch(() => undefined);
+    this.requestProviderSync();
   }
 
   private failLogin(session: LoginSession, message: string): void {
@@ -1650,6 +1891,7 @@ function newAccount(fields: Pick<StoredAccount, "id" | "family" | "kind" | "home
     limitedUntil: null,
     limitKind: null,
     limitedAt: null,
+    vertex: null,
     createdAt: new Date().toISOString(),
   };
 }
