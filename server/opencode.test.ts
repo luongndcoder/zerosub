@@ -182,6 +182,20 @@ describe("OpenCode limit detection", () => {
     expect(hit?.kind).toBe("window");
   });
 
+  it("spots the free tier and the balance errors OpenCode reports", async () => {
+    const { detectOpenCodeLimit } = await import("./limits");
+    const free = detectOpenCodeLimit({
+      outcome: { kind: "failed", error: { message: "Provider retry (attempt 1): Free usage exceeded, subscribe to Go" } },
+      timeline: [],
+    });
+    expect(free?.kind).toBe("window");
+    const funds = detectOpenCodeLimit({
+      outcome: { kind: "failed", error: { message: "Upstream request failed: Insufficient account funds" } },
+      timeline: [],
+    });
+    expect(funds?.kind).toBe("budget");
+  });
+
   it("spots a rejected key", async () => {
     const { detectOpenCodeSignOut } = await import("./limits");
     const message = detectOpenCodeSignOut({

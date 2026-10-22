@@ -52,8 +52,11 @@ const OPENCODE_LIMITS: ReadonlyArray<{ pattern: RegExp; kind: LimitKind }> = [
   { pattern: /too many requests/i, kind: "window" },
   { pattern: /rate[\s_-]?limit(?:ed| exceeded)?/i, kind: "window" },
   { pattern: /usage limit (?:reached|exceeded)/i, kind: "window" },
+  { pattern: /usage exceeded/i, kind: "window" },
+  { pattern: /subscribe to Go/i, kind: "window" },
   { pattern: /quota (?:exceeded|exhausted)/i, kind: "window" },
   { pattern: /insufficient[_\s-]?quota/i, kind: "budget" },
+  { pattern: /insufficient (?:account )?(?:funds|balance|credits?)/i, kind: "budget" },
   { pattern: /credit balance is too low/i, kind: "budget" },
 ];
 
