@@ -184,11 +184,13 @@ export class OpenCodeAdapter implements FamilyAdapter {
   }
 
   async env(home: string | null): Promise<EnvPatch> {
-    if (!home) return {}; // The user's own OpenCode login: nothing to override.
     const own = await this.credentials(home);
     if (Object.keys(own).length === 0) return {};
     // The account's keys win; the user's other providers (and their OAuth tokens) stay available.
     const merged = { ...(await readAuth(mainAuthPath())), ...own };
+    // The user's own login is included too: OpenCode reads its credentials when the server starts,
+    // so a server that started before a key change would keep using the old key. Handing the keys
+    // over in the environment gives every session a server that reads them as they are now.
     return { OPENCODE_AUTH_CONTENT: JSON.stringify(merged) };
   }
 

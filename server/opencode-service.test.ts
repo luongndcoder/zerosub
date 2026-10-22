@@ -58,32 +58,57 @@ function stubAdapter(family: "claude" | "codex"): FamilyAdapter {
 
 function fakePaseo() {
   const patches: unknown[] = [];
+  const notes: unknown[] = [];
+  const agent = {
+    id: AGENT,
+    provider: "opencode",
+    status: "idle",
+    archivedAt: null,
+    lastUserMessageAt: "2026-10-22T03:00:00.000Z",
+  };
   const paseo = {
     config: {
       get: async () => ({ config: { providers: {} } }),
       patch: async (patch: unknown) => void patches.push(patch),
     },
-    agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }) },
+    agents: {
+      list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
+      ref: () => ({
+        refresh: async () => ({ agent }),
+        send: async () => undefined,
+        timeline: {
+          append: async (item: { data: unknown }) => void notes.push(item.data),
+          refetch: async () => ({ entries: [] }),
+        },
+      }),
+    },
   };
-  return { paseo, patches };
+  return { paseo, patches, notes };
 }
 
 async function setUp() {
   const store = new StateStore(join(root, "state.json"));
   const fake = fakePaseo();
+  const reopened: string[] = [];
   const service = new Service(
     { claude: stubAdapter("claude"), codex: stubAdapter("codex"), opencode: new OpenCodeAdapter() },
     store,
     { resolve: async () => ({ opencode: "opencode" as const }) } as unknown as FamilyResolver,
-    { locate: async () => "/usr/local/bin/paseo", reopen: async () => ({ ok: true as const }) } as unknown as Reopener,
+    {
+      locate: async () => "/usr/local/bin/paseo",
+      reopen: async (agentId: string) => {
+        reopened.push(agentId);
+        return { ok: true as const };
+      },
+    } as unknown as Reopener,
   );
-  return { service, store, fake };
+  return { service, store, fake, reopened };
 }
 
 describe("OpenCode accounts", () => {
   it("keeps the keys in the account's own home and runs sessions on them", async () => {
     const { service, store, fake } = await setUp();
-    const accountId = await service.addOpenCodeAccount({ goKey: "sk-test-key", label: "Work" });
+    const accountId = await service.addOpenCodeAccount(fake.paseo as never, { goKey: "sk-test-key", label: "Work" });
 
     const state = await store.read();
     const account = state.accounts.find((entry) => entry.id === accountId);
@@ -106,19 +131,19 @@ describe("OpenCode accounts", () => {
   });
 
   it("refuses a key that is already added", async () => {
-    const { service } = await setUp();
-    await service.addOpenCodeAccount({ goKey: "sk-test-key" });
-    await expect(service.addOpenCodeAccount({ goKey: "sk-test-key" })).rejects.toThrow(/already added/i);
+    const { service, fake } = await setUp();
+    await service.addOpenCodeAccount(fake.paseo as never, { goKey: "sk-test-key" });
+    await expect(service.addOpenCodeAccount(fake.paseo as never, { goKey: "sk-test-key" })).rejects.toThrow(/already added/i);
   });
 
   it("refuses an empty account", async () => {
-    const { service } = await setUp();
-    await expect(service.addOpenCodeAccount({})).rejects.toThrow(/at least one API key/i);
+    const { service, fake } = await setUp();
+    await expect(service.addOpenCodeAccount(fake.paseo as never, {})).rejects.toThrow(/at least one API key/i);
   });
 
   it("lists the account with its own usage windows", async () => {
     const { service, fake } = await setUp();
-    await service.addOpenCodeAccount({ goKey: "sk-test-key" });
+    await service.addOpenCodeAccount(fake.paseo as never, { goKey: "sk-test-key" });
     const view = await service.view(fake.paseo as never);
     const account = view.accounts.find((entry) => entry.family === "opencode");
     expect(account?.status).toBe("ready");
@@ -126,7 +151,7 @@ describe("OpenCode accounts", () => {
   });
 
   it("replaces the key of the user's own OpenCode login, keeping their other keys", async () => {
-    const { service, store } = await setUp();
+    const { service, store, fake } = await setUp();
     await mkdir(join(mainAuthPath(), ".."), { recursive: true });
     await writeFile(
       mainAuthPath(),
@@ -153,12 +178,44 @@ describe("OpenCode accounts", () => {
         createdAt: new Date().toISOString(),
       });
     });
-    await service.addOpenCodeAccount({ goKey: "sk-new-key", accountId: MAIN_ACCOUNT_ID.opencode });
+    await service.addOpenCodeAccount(fake.paseo as never, { goKey: "sk-new-key", accountId: MAIN_ACCOUNT_ID.opencode });
 
     const auth = JSON.parse(await readFile(mainAuthPath(), "utf8")) as Record<string, { key?: string }>;
     expect(auth["opencode-go"]?.key).toBe("sk-new-key");
     expect(auth.anthropic?.key).toBe("sk-old");
     const account = (await store.read()).accounts.find((entry) => entry.id === MAIN_ACCOUNT_ID.opencode);
     expect(account?.signedIn).toBe(true);
+  });
+
+  it("restarts the agents that run on the account, so they use the new key", async () => {
+    const { service, store, fake, reopened } = await setUp();
+    await store.update((draft) => {
+      draft.accounts.push({
+        id: MAIN_ACCOUNT_ID.opencode,
+        family: "opencode",
+        label: "OpenCode (CLI login)",
+        autoLabel: false,
+        kind: "main",
+        home: null,
+        email: null,
+        plan: null,
+        organization: null,
+        identity: null,
+        signedIn: true,
+        disabled: false,
+        limitedUntil: null,
+        limitKind: null,
+        limitedAt: null,
+        vertex: null,
+        createdAt: new Date().toISOString(),
+      });
+      draft.sessions[AGENT] = {
+        accountId: MAIN_ACCOUNT_ID.opencode,
+        family: "opencode",
+        openedAt: new Date().toISOString(),
+      };
+    });
+    await service.addOpenCodeAccount(fake.paseo as never, { goKey: "sk-new-key", accountId: MAIN_ACCOUNT_ID.opencode });
+    expect(reopened).toContain(AGENT);
   });
 });

@@ -76,7 +76,9 @@ export default function contribute(server: PluginServerContext) {
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
   server.handle(addVertexAccount, async (input) => ({ accountId: await service.addVertexAccount(input) }));
-  server.handle(addOpenCodeAccount, async (input) => ({ accountId: await service.addOpenCodeAccount(input) }));
+  server.handle(addOpenCodeAccount, async (input, { paseo }) => ({
+    accountId: await service.addOpenCodeAccount(paseo, input),
+  }));
   server.handle(renameAccount, async ({ accountId, label }) => {
     await service.rename(accountId, label);
     return { ok: true as const };

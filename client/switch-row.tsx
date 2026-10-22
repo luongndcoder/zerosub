@@ -34,6 +34,9 @@ function isFork(row: SwitchRow): boolean {
 }
 
 export function describeRow(row: SwitchRow): string {
+  if (row.reason === "keys") {
+    return "The account's API keys were replaced, so the session was restarted with the new ones.";
+  }
   if (isFork(row) && row.toFamily && row.continuedIn) {
     const reset = formatResetIn(row.resetsAt);
     const lead =

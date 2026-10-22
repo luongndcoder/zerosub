@@ -27,6 +27,8 @@ export const SwitchRowSchema = z.object({
     "exhausted",
     /** The agent leaves the pay-per-use Vertex fallback because `to` has room again. */
     "returned",
+    /** The account's API keys were replaced, so the session was restarted with the new ones. */
+    "keys",
   ]),
   /** When the exhausted account frees up again, if known. */
   resetsAt: z.string().nullable(),

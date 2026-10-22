@@ -153,6 +153,8 @@ export class Service {
   };
   /** Agents whose account changed mid-turn; reopened when the turn ends. */
   private readonly deferred = new Map<string, SwitchRow | null>();
+  /** Agents that must be reopened once their turn ends, because their account's keys changed. */
+  private readonly pendingRestart = new Set<string>();
   /** Agents in the middle of a failover, so nothing else moves them at the same time. */
   private readonly switching = new Set<string>();
   /** One failover at a time per exhausted account. */
@@ -471,6 +473,11 @@ export class Service {
     }
     if (this.deferred.has(agentId)) await this.finishDeferred(context.paseo, agentId, family);
     else if (await this.returnFromVertex(context.paseo, agentId, family)) return;
+    if (this.pendingRestart.has(agentId)) {
+      this.pendingRestart.delete(agentId);
+      await this.restartAgentAfterTurn(context.paseo, agentId, family);
+      return;
+    }
     // The turn just used the account: read its usage again as soon as the provider allows.
     if (accountId) void this.refreshUsage(accountId).catch(() => undefined);
   }
@@ -778,6 +785,27 @@ export class Service {
         detail: `Couldn't start a new agent on ${next.label}: ${describe(error)}`,
       });
     }
+  }
+
+  /** Reopens an agent whose account got new keys while it was working. */
+  private async restartAgentAfterTurn(paseo: PaseoApi, agentId: string, family: Family): Promise<void> {
+    const state = await this.store.read();
+    const account = findAccount(state, this.runningOn(state, agentId, family));
+    const outcome = await this.reopenAgent(paseo, agentId, null, true);
+    if (outcome !== "reopened" || !account) return;
+    await this.appendRow(paseo, agentId, {
+      family,
+      from: account.label,
+      to: account.label,
+      reason: "keys",
+      resetsAt: null,
+      continued: false,
+      continuedIn: null,
+      toFamily: null,
+      outcome: "switched",
+      detail: null,
+      at: new Date().toISOString(),
+    });
   }
 
   private async markLimited(accountId: string, until: string, kind: LimitKind): Promise<void> {
@@ -1575,15 +1603,18 @@ export class Service {
    * with API keys rather than a browser flow, so the keys are stored in the account's own home and
    * handed to OpenCode through the environment when a session opens.
    */
-  async addOpenCodeAccount(input: {
-    label?: string;
-    goKey?: string;
-    zenKey?: string;
-    otherProvider?: string;
-    otherKey?: string;
-    /** Replace the keys of this account instead of adding a new one. */
-    accountId?: string;
-  }): Promise<string> {
+  async addOpenCodeAccount(
+    paseo: PaseoApi,
+    input: {
+      label?: string;
+      goKey?: string;
+      zenKey?: string;
+      otherProvider?: string;
+      otherKey?: string;
+      /** Replace the keys of this account instead of adding a new one. */
+      accountId?: string;
+    },
+  ): Promise<string> {
     const credentials: OpenCodeCredentials = {};
     const goKey = input.goKey?.trim();
     const zenKey = input.zenKey?.trim();
@@ -1629,6 +1660,7 @@ export class Service {
       console.log(`[ZeroSub] updated the OpenCode login for ${existing.label}`);
       this.identityCheckedAt.set(existing.id, Date.now());
       void this.refreshUsage(existing.id, true).catch(() => undefined);
+      await this.restartAgentsOn(paseo, existing.id, existing.label);
       return existing.id;
     }
     let accountId = existing?.id;
@@ -1663,7 +1695,46 @@ export class Service {
     void this.refreshUsage(accountId, true).catch(() => undefined);
     this.requestProviderSync();
     console.log(`[ZeroSub] saved the OpenCode account ${accountId}`);
+    await this.restartAgentsOn(paseo, accountId, findAccount(await this.store.read(), accountId)?.label ?? accountId);
     return accountId;
+  }
+
+  /**
+   * Restarts the agents that run on an account whose keys just changed. OpenCode reads its
+   * credentials when its server starts, so a running session keeps the old key until it is
+   * reopened. Busy agents are reopened when their turn ends.
+   */
+  private async restartAgentsOn(paseo: PaseoApi, accountId: string, label: string): Promise<void> {
+    const state = await this.store.read();
+    const families = await this.families.resolve(paseo);
+    const agents = await this.cachedAgents(paseo);
+    for (const agent of agents) {
+      if (agent.archived || !isLive(agent.status)) continue;
+      const family = families[agent.provider];
+      if (!family) continue;
+      if (this.runningOn(state, agent.id, family) !== accountId) continue;
+      if (this.switching.has(agent.id)) continue;
+      if (agent.status !== "idle") {
+        // The agent is working: reopen it once its turn is over.
+        this.pendingRestart.add(agent.id);
+        continue;
+      }
+      const outcome = await this.reopenAgent(paseo, agent.id, null, true);
+      if (outcome !== "reopened") continue;
+      await this.appendRow(paseo, agent.id, {
+        family,
+        from: label,
+        to: label,
+        reason: "keys",
+        resetsAt: null,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        outcome: "switched",
+        detail: null,
+        at: new Date().toISOString(),
+      });
+    }
   }
 
   async rename(accountId: string, label: string): Promise<void> {
