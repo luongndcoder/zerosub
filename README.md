@@ -1,6 +1,6 @@
 # ZeroSub
 
-Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI.
+Use several Claude, ChatGPT (Codex) and OpenCode subscriptions side by side in [Paseo](https://paseo.sh), without logging in and out of the CLI.
 
 - **Add accounts in the app.** Click **Add account** under Claude or ChatGPT and sign in on any device, including your phone. You don't need a terminal, environment variables or config files.
 - **Your existing CLI logins show up automatically.** Nothing changes until you add a second account.
@@ -11,6 +11,7 @@ Use several Claude and ChatGPT (Codex) subscriptions side by side in [Paseo](htt
 - **Set an account aside.** Disable an account for a while and its agents move to your other accounts, then come back when you enable it again.
 - **Several hosts.** Each Paseo host keeps its own accounts, and the Accounts screen says which host you're looking at.
 - **Fork to the other provider (optional).** When every Claude account is out, a stopped chat can carry on in a new ChatGPT agent, and the other way round.
+- **OpenCode accounts too.** Add an account by pasting its OpenCode Go (or Zen, or any other provider) API key. Each agent runs on one account, and agents move on when a key runs out of room.
 - **Everything else stays the same.** Every account shares your settings, skills, plugins, MCP servers, `CLAUDE.md`/`AGENTS.md` and conversation history.
 
 ## Install
@@ -93,6 +94,22 @@ Add Claude on Google Vertex AI as a pay-per-use safety net: **Accounts → Claud
 - Sessions on Vertex run with `CLAUDE_CODE_USE_VERTEX=1`, `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`, on your CLI login's home, so settings, skills, MCP servers and history stay shared.
 - Vertex bills per token and has no usage windows, so its card shows no usage bars.
 
+## OpenCode accounts
+
+Add an OpenCode account by pasting its API keys. OpenCode signs in with keys rather than a browser flow, so this is the one provider you add from the app by typing a key.
+
+- **Add an account.** In **Accounts → OpenCode → Add account**, paste an OpenCode Go key (from [opencode.ai/go](https://opencode.ai/go)), an OpenCode Zen key (from [opencode.ai/zen](https://opencode.ai/zen)), or a key for any other provider OpenCode can use. One account holds one set of keys.
+- **Pick an account per agent,** just like Claude and ChatGPT: the account button in the message box, `/account work`, the per-account providers in the new-agent picker, or **Make default**.
+- **Automatic switching.** When OpenCode reports that the key is rate-limited, the agent moves to the account with the most room left and carries on. A key the provider rejects (401) is marked as signed out, and agents move off it.
+- **Live usage.** An account with an OpenCode Go key shows its rolling, weekly and monthly usage and when they reset, read from OpenCode Go's own usage endpoint — the same one Paseo's OpenCode Go usage source reads. Keys for other providers show no bars, because those providers have no common usage API.
+
+### How it works
+
+- Each account's keys live in their own folder under `$PASEO_HOME/zerosub/homes/opencode-<id>/`, readable by the daemon user only. Your own `~/.local/share/opencode/auth.json` is never changed.
+- When a session opens, ZeroSub hands OpenCode the account's keys through the `OPENCODE_AUTH_CONTENT` environment variable. OpenCode then ignores `auth.json` and uses the keys it is given.
+- Only the keys change: your OpenCode config, models, plugins and conversation history stay shared, so an agent can move to another account in place and keep its conversation.
+- Your other OpenCode keys keep working: the account's keys are merged with the ones you already have, and the account's win.
+
 ## Several hosts
 
 Paseo installs plugins per host (daemon), so install ZeroSub on each host whose agents should use it. When more than one host has it, Paseo shows a single **Accounts (ZeroSub)** item with a host picker at the top.
@@ -107,7 +124,7 @@ Paseo installs plugins per host (daemon), so install ZeroSub on each host whose 
 
 Each added account gets its own credential home under `$PASEO_HOME/zerosub/homes/`:
 
-- Claude uses it as `CLAUDE_CONFIG_DIR`; Codex uses it as `CODEX_HOME`.
+- Claude uses it as `CLAUDE_CONFIG_DIR`; Codex uses it as `CODEX_HOME`; OpenCode keeps its API keys in it.
 - The CLIs keep each home's login separate: Claude in its own keychain entry (`.credentials.json` on Linux), Codex in its own `auth.json`.
 - Everything that isn't account-specific is a symlink back to `~/.claude` or `~/.codex`. For Claude that includes `settings.json`, `skills/`, `plugins/` and `projects/`; for Codex, `config.toml`, `sessions/` and more. Codex also shares its thread database through `CODEX_SQLITE_HOME`.
 - Claude's `.claude.json` holds the account identity, so each account keeps its own copy. It's seeded from yours, and your MCP servers stay in sync.

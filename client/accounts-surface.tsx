@@ -15,6 +15,7 @@ import {
   type ReopenSummary,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { AddOpenCodeAccountModal } from "./add-opencode-account";
 import { AddVertexAccountModal } from "./add-vertex-account";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
 import { describe, useStore, VISIBLE_POLL_MS, type ZeroSubStore } from "./store";
@@ -28,6 +29,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   const text = useText(theme);
   const [adding, setAdding] = useState<{ family: Family; accountId?: string } | null>(null);
   const [addingVertex, setAddingVertex] = useState(false);
+  const [addingOpenCode, setAddingOpenCode] = useState<{ accountId?: string; label?: string; main?: boolean } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshUsage = useCallback(async () => {
     setRefreshing(true);
@@ -45,7 +47,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
   // Keep usage moving while the screen is open.
   useEffect(() => store.watch(VISIBLE_POLL_MS), [store]);
 
-  const families: Family[] = ["claude", "codex"];
+  const families: Family[] = ["claude", "codex", "opencode"];
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
       <ScrollView
@@ -76,7 +78,7 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
             ) : null}
           </View>
           <Text style={text.muted}>
-            Keep several Claude and ChatGPT accounts signed in. Each agent uses one; when an account
+            Keep several Claude, ChatGPT and OpenCode accounts signed in. Each agent uses one; when an account
             hits its limit, agents move to another and keep going.
           </Text>
         </View>
@@ -120,9 +122,17 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
                 theme={theme}
                 compact={layout.compact}
                 store={store}
-                onAdd={() => setAdding({ family })}
+                onAdd={() => (family === "opencode" ? setAddingOpenCode({}) : setAdding({ family }))}
                 onAddVertex={family === "claude" ? () => setAddingVertex(true) : undefined}
-                onSignIn={(account) => setAdding({ family, accountId: account.id })}
+                onSignIn={(account) =>
+                  family === "opencode"
+                    ? setAddingOpenCode({
+                        accountId: account.id,
+                        label: account.label,
+                        main: account.kind === "main",
+                      })
+                    : setAdding({ family, accountId: account.id })
+                }
               />
             ))
           : null}
@@ -137,6 +147,18 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
           multiHost={multiHost}
           store={store}
           onClose={() => setAddingVertex(false)}
+        />
+      ) : null}
+      {addingOpenCode ? (
+        <AddOpenCodeAccountModal
+          theme={theme}
+          host={host}
+          multiHost={multiHost}
+          store={store}
+          accountId={addingOpenCode.accountId}
+          accountLabel={addingOpenCode.label}
+          main={addingOpenCode.main}
+          onClose={() => setAddingOpenCode(null)}
         />
       ) : null}
       {adding ? (
@@ -209,7 +231,7 @@ function FamilySection({
     <View style={{ gap: 10 }}>
       <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
         <Text style={text.heading} accessibilityRole="header">
-          {family === "claude" ? "Claude" : "ChatGPT (Codex)"}
+          {family === "claude" ? "Claude" : family === "codex" ? "ChatGPT (Codex)" : "OpenCode"}
         </Text>
         <View style={{ flexDirection: "row", gap: 8 }}>
           {onAddVertex ? (
@@ -228,7 +250,11 @@ function FamilySection({
             icon="Plus"
             label={compact ? "Add" : "Add account"}
             accessibilityLabel={`Add ${FAMILY_LABEL[family]} account`}
-            tooltip={`Sign in another ${FAMILY_LABEL[family]} account`}
+            tooltip={
+              family === "opencode"
+                ? `Add another ${FAMILY_LABEL[family]} account by pasting its API key`
+                : `Sign in another ${FAMILY_LABEL[family]} account`
+            }
             tooltipAlign="end"
             onPress={onAdd}
           />
@@ -416,7 +442,9 @@ function AccountCard({
         {account.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {disabled ? <Badge theme={theme} label="Disabled" /> : null}
         {plan ? <Badge theme={theme} label={plan} /> : null}
-        {account.kind === "main" ? <Badge theme={theme} label="CLI login" /> : null}
+        {account.kind === "main" ? (
+          <Badge theme={theme} label={account.family === "opencode" ? "Your own login" : "CLI login"} />
+        ) : null}
         {vertex ? <Badge theme={theme} label="Fallback" tone="warning" /> : null}
         {account.status === "limited" ? <Badge theme={theme} label="Limit reached" tone="danger" /> : null}
         {account.status === "signed_out" ? <Badge theme={theme} label="Signed out" tone="warning" /> : null}
@@ -429,7 +457,11 @@ function AccountCard({
             No Google credentials on the daemon host. Run gcloud auth application-default login there.
           </Text>
         ) : signedOut ? (
-          <Text style={text.small}>Sign in again to use this account.</Text>
+          <Text style={text.small}>
+            {account.family === "opencode"
+              ? "Paste new API keys to use this account."
+              : "Sign in again to use this account."}
+          </Text>
         ) : vertex ? (
           <Text style={text.small}>
             Used only when every Claude subscription account is out; agents move back once one has room.
@@ -468,8 +500,8 @@ function AccountCard({
             size="small"
             tone="primary"
             icon="LogIn"
-            label="Sign in"
-            tooltip="Sign this account in again"
+            label={account.family === "opencode" ? "Add keys" : "Sign in"}
+            tooltip={account.family === "opencode" ? "Paste new API keys for this account" : "Sign this account in again"}
             tooltipAlign="end"
             onPress={onSignIn}
           />
@@ -525,7 +557,9 @@ function AccountCard({
           <Text style={text.body}>
             {account.family === "claude"
               ? "This signs the account out on this machine and deletes its saved login. Agents using it move to the default account; their conversations are kept."
-              : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
+              : account.family === "opencode"
+                ? "This deletes the API keys saved for this account on this machine. Agents using it move to the default account; their conversations are kept."
+                : "This signs the account out on this machine and deletes its saved login. New agents use the default account. Existing ChatGPT conversations on it can't move, so start new agents for them."}
           </Text>
           <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Keep this account" tooltipAlign="end" onPress={() => setConfirmRemove(false)} />

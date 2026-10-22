@@ -42,6 +42,24 @@ const CLAUDE_SIGNED_OUT =
 const CODEX_SIGNED_OUT =
   /refresh token was already used|please log out and sign in again|access token could not be refreshed|refresh_token_reused|refresh_token_expired/i;
 
+/**
+ * OpenCode reports what the model provider answered, so its limits and auth failures arrive as
+ * provider messages. Only errors and notifications are read: an assistant reply that merely talks
+ * about a rate limit is not a limit.
+ */
+const OPENCODE_LIMITS: ReadonlyArray<{ pattern: RegExp; kind: LimitKind }> = [
+  { pattern: /\b429\b/, kind: "window" },
+  { pattern: /too many requests/i, kind: "window" },
+  { pattern: /rate[\s_-]?limit(?:ed| exceeded)?/i, kind: "window" },
+  { pattern: /usage limit (?:reached|exceeded)/i, kind: "window" },
+  { pattern: /quota (?:exceeded|exhausted)/i, kind: "window" },
+  { pattern: /insufficient[_\s-]?quota/i, kind: "budget" },
+  { pattern: /credit balance is too low/i, kind: "budget" },
+];
+
+const OPENCODE_SIGNED_OUT =
+  /\b401\b|\b403\b|unauthorized|forbidden|invalid[_\s-]?api[_\s-]?key|invalid[_\s-]?credentials?|authentication[_\s-]?error/i;
+
 const SYSTEM_ERROR = /^\[System Error\]\s*/;
 const MAX_NOTICE = 400;
 
@@ -105,6 +123,21 @@ export function detectClaudeSignOut(event: TurnEvent): string | null {
 
 export function detectCodexSignOut(event: TurnEvent): string | null {
   for (const text of notices(event, false)) if (CODEX_SIGNED_OUT.test(text)) return firstLine(text);
+  return null;
+}
+
+/** A turn that stopped because the OpenCode account ran out of room or its key was refused. */
+export function detectOpenCodeLimit(event: TurnEvent): LimitHit | null {
+  for (const text of notices(event, false)) {
+    const match = OPENCODE_LIMITS.find(({ pattern }) => pattern.test(text));
+    if (match) return { message: firstLine(text), kind: match.kind, resetsAt: null };
+  }
+  return null;
+}
+
+/** A turn that failed because the OpenCode account's key is no longer accepted. */
+export function detectOpenCodeSignOut(event: TurnEvent): string | null {
+  for (const text of notices(event, false)) if (OPENCODE_SIGNED_OUT.test(text)) return firstLine(text);
   return null;
 }
 

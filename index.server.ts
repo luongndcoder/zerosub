@@ -1,6 +1,7 @@
 import type { PluginServerContext, PluginSettingsState } from "@getpaseo/plugin/server";
 import { ClaudeAdapter } from "./server/claude";
 import { CodexAdapter } from "./server/codex";
+import { OpenCodeAdapter } from "./server/opencode";
 import { Service, describe } from "./server/service";
 import { preferences } from "./shared/preferences";
 import {
@@ -9,6 +10,7 @@ import {
   getState,
   redeemReset,
   removeAccount,
+  addOpenCodeAccount,
   addVertexAccount,
   renameAccount,
   setAgentAccount,
@@ -20,7 +22,11 @@ import {
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
-  const service = new Service({ claude: new ClaudeAdapter(), codex: new CodexAdapter() });
+  const service = new Service({
+    claude: new ClaudeAdapter(),
+    codex: new CodexAdapter(),
+    opencode: new OpenCodeAdapter(),
+  });
 
   const settings = server.registerSettings(preferences);
   const applySettings = (state: PluginSettingsState<typeof preferences.schema>) => {
@@ -70,6 +76,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(submitLoginCode, ({ loginId, code }) => service.submitCode(loginId, code));
   server.handle(cancelLogin, ({ loginId }) => service.cancelLogin(loginId));
   server.handle(addVertexAccount, async (input) => ({ accountId: await service.addVertexAccount(input) }));
+  server.handle(addOpenCodeAccount, async (input) => ({ accountId: await service.addOpenCodeAccount(input) }));
   server.handle(renameAccount, async ({ accountId, label }) => {
     await service.rename(accountId, label);
     return { ok: true as const };

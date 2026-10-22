@@ -1,12 +1,13 @@
 import { z } from "zod";
 
-/** The two subscription families this plugin manages. Custom provider profiles map onto one of them. */
-export const FamilySchema = z.enum(["claude", "codex"]);
+/** The subscription families this plugin manages. Custom provider profiles map onto one of them. */
+export const FamilySchema = z.enum(["claude", "codex", "opencode"]);
 export type Family = z.infer<typeof FamilySchema>;
 
 export const FAMILY_LABEL: Record<Family, string> = {
   claude: "Claude",
   codex: "ChatGPT",
+  opencode: "OpenCode",
 };
 
 export const UsageWindowSchema = z.object({

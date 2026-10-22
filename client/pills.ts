@@ -158,8 +158,10 @@ function buttonFor(
   const resets = current.usage?.resets ?? null;
   const offerReset = resets !== null && (current.status === "limited" || resets.usableNow);
   // With every account of this provider out, the work can carry on with the other provider.
-  const other: Family = family === "claude" ? "codex" : "claude";
+  // OpenCode has no other provider to carry on to.
+  const other: Family | null = family === "claude" ? "codex" : family === "codex" ? "claude" : null;
   const offerFork =
+    other !== null &&
     current.status === "limited" &&
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
@@ -192,7 +194,7 @@ function buttonFor(
     if (current.status === "limited") wayOut.push(entry);
     else items.push(entry);
   }
-  if (offerFork) {
+  if (offerFork && other) {
     wayOut.push({
       kind: "item",
       id: "fork-other",

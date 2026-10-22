@@ -41,6 +41,27 @@ export const addVertexAccount = defineRpc({
   output: z.object({ accountId: z.string() }),
 });
 
+/**
+ * Adds an OpenCode account from its API keys, or replaces the keys of one that is already added.
+ * OpenCode has no browser sign-in for API keys, so the keys are pasted.
+ */
+export const addOpenCodeAccount = defineRpc({
+  name: "zerosub.accounts.add-opencode",
+  input: z.object({
+    label: z.string().trim().max(40).optional(),
+    /** OpenCode Go subscription key. */
+    goKey: z.string().trim().optional(),
+    /** OpenCode Zen key. */
+    zenKey: z.string().trim().optional(),
+    /** Any other provider OpenCode can use, e.g. `anthropic`. */
+    otherProvider: z.string().trim().max(40).optional(),
+    otherKey: z.string().trim().optional(),
+    /** Replace the keys of this account instead of adding a new one. */
+    accountId: z.string().optional(),
+  }),
+  output: z.object({ accountId: z.string() }),
+});
+
 export const renameAccount = defineRpc({
   name: "zerosub.accounts.rename",
   input: z.object({ accountId: z.string(), label: z.string().trim().min(1).max(40) }),

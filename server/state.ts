@@ -54,8 +54,12 @@ export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
   defaults: z
-    .object({ claude: z.string().nullable().default(null), codex: z.string().nullable().default(null) })
-    .default({ claude: null, codex: null }),
+    .object({
+      claude: z.string().nullable().default(null),
+      codex: z.string().nullable().default(null),
+      opencode: z.string().nullable().default(null),
+    })
+    .default({ claude: null, codex: null, opencode: null }),
   /** Per-agent overrides of the default account. */
   bindings: z.record(z.string(), BindingSchema).default({}),
   /** Which account each agent's live provider session was opened with. */
@@ -63,7 +67,11 @@ export const StoredStateSchema = z.object({
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
-export const MAIN_ACCOUNT_ID: Record<Family, string> = { claude: "claude-main", codex: "codex-main" };
+export const MAIN_ACCOUNT_ID: Record<Family, string> = {
+  claude: "claude-main",
+  codex: "codex-main",
+  opencode: "opencode-main",
+};
 
 export function emptyState(): StoredState {
   return StoredStateSchema.parse({});
@@ -95,7 +103,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
     }
     return result;
   };
-  const defaults = keep(StoredStateSchema.shape.defaults, source.defaults) ?? { claude: null, codex: null };
+  const defaults = keep(StoredStateSchema.shape.defaults, source.defaults) ?? { claude: null, codex: null, opencode: null };
   return {
     state: {
       version: 1,

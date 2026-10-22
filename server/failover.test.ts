@@ -113,7 +113,7 @@ async function setUp(state: Partial<StoredState>, hit: () => LimitHit, options: 
   const families = { resolve: async () => ({ claude: "claude" as const }) };
   const claude = { ...claudeAdapter(hit), ...(options.detectLimit ? { detectLimit: options.detectLimit } : {}) };
   const service = new Service(
-    { claude, codex: claudeAdapter(hit) },
+    { claude, codex: claudeAdapter(hit), opencode: claudeAdapter(hit) },
     store,
     families as unknown as FamilyResolver,
     reopener as unknown as Reopener,
@@ -135,7 +135,7 @@ describe("failover", () => {
     const { store, reopened, sent, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: {},
       },
@@ -156,7 +156,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt, message: "You've hit your session limit" }),
@@ -173,7 +173,7 @@ describe("failover", () => {
     const { reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt: inPast(), message: "You've hit your session limit" }),
@@ -191,7 +191,7 @@ describe("failover", () => {
     const { service, store, reopened, notes, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => {
@@ -228,7 +228,7 @@ describe("failover", () => {
     const { store, reopened, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -247,7 +247,7 @@ describe("failover", () => {
     const { store, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: "2026-09-23T07:00:00.000Z" } },
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your weekly limit" }),
@@ -278,7 +278,7 @@ describe("forking to the other provider", () => {
     await store.update((draft) =>
       Object.assign(draft, {
         accounts: [account(MAIN, "marketing", "main"), { ...account(CODEX_MAIN, "hello", "main"), family: "codex" }],
-        defaults: { claude: MAIN, codex: CODEX_MAIN },
+        defaults: { claude: MAIN, codex: CODEX_MAIN, opencode: null },
       }),
     );
     const source = {
@@ -326,6 +326,7 @@ describe("forking to the other provider", () => {
       {
         claude: claudeAdapter(() => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" })),
         codex: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "codex", portable: false } as FamilyAdapter,
+        opencode: { ...claudeAdapter(() => ({ kind: "window", resetsAt: null, message: "" })), family: "opencode" } as FamilyAdapter,
       },
       store,
       { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
@@ -376,7 +377,7 @@ describe("disabling an account", () => {
     const { service, store, reopened } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         bindings: { [AGENT]: { accountId: HELLO, source: "user", at: new Date().toISOString() } },
         sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
       },
@@ -426,7 +427,7 @@ describe("Vertex AI fallback", () => {
 
   it("moves the agent to Vertex in place once every subscription account is out", async () => {
     const { service, store, reopened, notes, paseo, limitTurn } = await setUp(
-      { accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never, defaults: { claude: MAIN, codex: null }, sessions: {} },
+      { accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never, defaults: { claude: MAIN, codex: null, opencode: null }, sessions: {} },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
     );
     await limitTurn();
@@ -445,7 +446,7 @@ describe("Vertex AI fallback", () => {
     const { store, notes, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), vertexAccount, account(HELLO, "hello", "managed")] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         sessions: {},
       },
       () => ({ kind: "window", resetsAt: inFuture(), message: "You've hit your session limit" }),
@@ -460,7 +461,7 @@ describe("Vertex AI fallback", () => {
     const { service, store, reopened, notes, paseo } = await setUp(
       {
         accounts: [{ ...account(MAIN, "marketing", "main"), limitedUntil: inPast() }, vertexAccount] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         bindings: { [AGENT]: { accountId: VERTEX, source: "auto", at } },
         sessions: { [AGENT]: { accountId: VERTEX, family: "claude", openedAt: at } },
       },
@@ -477,7 +478,7 @@ describe("Vertex AI fallback", () => {
     const { service, store, reopened, paseo } = await setUp(
       {
         accounts: [account(MAIN, "marketing", "main"), vertexAccount] as never,
-        defaults: { claude: MAIN, codex: null },
+        defaults: { claude: MAIN, codex: null, opencode: null },
         bindings: { [AGENT]: { accountId: VERTEX, source: "user", at } },
         sessions: { [AGENT]: { accountId: VERTEX, family: "claude", openedAt: at } },
       },
@@ -492,7 +493,7 @@ describe("Vertex AI fallback", () => {
 describe("per-account providers", () => {
   it("starts a new agent picked as \"Claude · hello\" on hello, pinned there", async () => {
     const { service, store, paseo } = await setUp(
-      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null } },
+      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null, opencode: null } },
       () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
     );
     const opened = await service.onSessionOpen(
@@ -505,7 +506,7 @@ describe("per-account providers", () => {
 
   it("adds one provider profile per account to the daemon config", async () => {
     const { service, paseo, patches } = await setUp(
-      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null } },
+      { accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never, defaults: { claude: MAIN, codex: null, opencode: null } },
       () => ({ kind: "window", resetsAt: inFuture(), message: "unused" }),
     );
     service.attach(paseo as never);

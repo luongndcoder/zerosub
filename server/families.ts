@@ -19,6 +19,14 @@ const OWN_AUTH_KEYS: Record<Family, readonly string[]> = {
     "CLAUDE_CODE_USE_FOUNDRY",
   ],
   codex: ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME", "OPENAI_BASE_URL"],
+  opencode: [
+    "OPENCODE_API_KEY",
+    "OPENCODE_AUTH_CONTENT",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_CONFIG_DIR",
+    "XDG_DATA_HOME",
+  ],
 };
 
 export function bringsOwnAuth(family: Family, env: Record<string, unknown> | undefined): boolean {
@@ -37,15 +45,16 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 export function familiesFromConfig(providers: Record<string, unknown> | undefined): Record<string, Family> {
   const result: Record<string, Family> = {};
   const entries = providers ?? {};
-  for (const family of ["claude", "codex"] as const) {
+  const builtins = ["claude", "codex", "opencode"] as const;
+  for (const family of builtins) {
     const entry = asRecord(entries[family]);
     if (!entry || !bringsOwnAuth(family, asRecord(entry.env))) result[family] = family;
   }
   for (const [id, value] of Object.entries(entries)) {
-    if (id === "claude" || id === "codex") continue;
+    if (builtins.includes(id as (typeof builtins)[number])) continue;
     const entry = asRecord(value);
     const base = entry?.extends;
-    if (base !== "claude" && base !== "codex") continue;
+    if (base !== "claude" && base !== "codex" && base !== "opencode") continue;
     if (bringsOwnAuth(base, asRecord(entry?.env))) continue;
     result[id] = base;
   }
@@ -71,7 +80,7 @@ export class FamilyResolver {
       value = familiesFromConfig(asRecord(config.providers));
     } catch (error) {
       console.warn("[ZeroSub] could not read provider config; using built-in providers only", describe(error));
-      value = { claude: "claude", codex: "codex" };
+      value = { claude: "claude", codex: "codex", opencode: "opencode" };
     }
     this.cache = { at: Date.now(), value };
     return value;

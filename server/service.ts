@@ -37,6 +37,14 @@ import { removeHome } from "./homes";
 import { Mutex } from "./json-file";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
+import {
+  credentialFingerprint,
+  planOf,
+  verifyGoKey,
+  writeCredentials,
+  writeMainCredentials,
+  type OpenCodeCredentials,
+} from "./opencode";
 import { homesDir } from "./paths";
 import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
@@ -57,9 +65,9 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const FAMILIES: readonly Family[] = ["claude", "codex"];
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex" };
-const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" };
+const FAMILIES: readonly Family[] = ["claude", "codex", "opencode"];
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude", opencode: "opencode" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -138,7 +146,11 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = {
+    claude: new Mutex(),
+    codex: new Mutex(),
+    opencode: new Mutex(),
+  };
   /** Agents whose account changed mid-turn; reopened when the turn ends. */
   private readonly deferred = new Map<string, SwitchRow | null>();
   /** Agents in the middle of a failover, so nothing else moves them at the same time. */
@@ -328,7 +340,13 @@ export class Service {
       }
       for (const name of names) {
         const home = join(root, name);
-        const family: Family | null = name.startsWith("claude-") ? "claude" : name.startsWith("codex-") ? "codex" : null;
+        const family: Family | null = name.startsWith("claude-")
+          ? "claude"
+          : name.startsWith("codex-")
+            ? "codex"
+            : name.startsWith("opencode-")
+              ? "opencode"
+              : null;
         if (!family || owned.has(home)) continue;
         // A managed account's ID is its home's folder name, so sessions still name it after removal.
         const users = Object.entries(state.sessions)
@@ -676,7 +694,7 @@ export class Service {
     if (!next) {
       if (reason !== "limit") return;
       let detail: string | null = null;
-      if (this.prefs.forkOtherProvider) {
+      if (this.prefs.forkOtherProvider && family !== "opencode") {
         // Opt-in: every account of this provider is out, so carry on with the other provider.
         const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto").catch((error: unknown) => ({
           skipped: `Couldn't continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${describe(error)}`,
@@ -696,7 +714,7 @@ export class Service {
         }
         console.log(`[ZeroSub] not continuing ${agentId} on ${FAMILY_LABEL[OTHER_FAMILY[family]]}: ${result.skipped}`);
         detail = result.skipped;
-      } else if (mostAvailable(latest, OTHER_FAMILY[family], (id) => this.usage.get(id), now, new Set())) {
+      } else if (family !== "opencode" && mostAvailable(latest, OTHER_FAMILY[family], (id) => this.usage.get(id), now, new Set())) {
         detail = `Or continue on ${FAMILY_LABEL[OTHER_FAMILY[family]]} in a new agent from the account button.`;
       }
       await this.appendRow(paseo, agentId, { ...base, to: account.label, reason: "exhausted", outcome: "stayed", detail });
@@ -962,6 +980,9 @@ export class Service {
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
   ): Promise<{ fork: Continuation; account: StoredAccount; family: Family } | { skipped: string }> {
+    if (family === "opencode") {
+      return { skipped: "OpenCode conversations don't carry on to another provider." };
+    }
     const other = OTHER_FAMILY[family];
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
@@ -1025,7 +1046,10 @@ export class Service {
     const info = await agentInfo(paseo, agentId);
     if (!info || info.archived) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT or OpenCode accounts.`);
+    if (family === "opencode") {
+      throw new Error("OpenCode conversations don't carry on to another provider.");
+    }
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
@@ -1473,7 +1497,7 @@ export class Service {
     const info = await agentInfo(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
+    if (!family) throw new Error(`${info.provider} agents don't use Claude, ChatGPT or OpenCode accounts.`);
     const adapter = this.adapters[family];
     const state = await this.store.read();
     const target = accountId ? findAccount(state, accountId) : defaultAccount(state, family);
@@ -1546,6 +1570,102 @@ export class Service {
     return id;
   }
 
+  /**
+   * Adds an OpenCode account, or replaces the keys of one that is already added. OpenCode signs in
+   * with API keys rather than a browser flow, so the keys are stored in the account's own home and
+   * handed to OpenCode through the environment when a session opens.
+   */
+  async addOpenCodeAccount(input: {
+    label?: string;
+    goKey?: string;
+    zenKey?: string;
+    otherProvider?: string;
+    otherKey?: string;
+    /** Replace the keys of this account instead of adding a new one. */
+    accountId?: string;
+  }): Promise<string> {
+    const credentials: OpenCodeCredentials = {};
+    const goKey = input.goKey?.trim();
+    const zenKey = input.zenKey?.trim();
+    const otherProvider = input.otherProvider?.trim();
+    const otherKey = input.otherKey?.trim();
+    if (goKey) credentials["opencode-go"] = { type: "api", key: goKey };
+    if (zenKey) credentials["opencode"] = { type: "api", key: zenKey };
+    if (otherProvider && otherKey) credentials[otherProvider] = { type: "api", key: otherKey };
+    if (otherProvider && !otherKey) throw new Error(`Add the API key for ${otherProvider}, or clear its name.`);
+    if (Object.keys(credentials).length === 0) throw new Error("Paste at least one API key.");
+    // OpenCode Go is the only provider that can be checked before the account is added.
+    if (goKey) await verifyGoKey(goKey);
+
+    const state = await this.store.read();
+    const existing = input.accountId ? findAccount(state, input.accountId) : undefined;
+    if (input.accountId && (!existing || existing.family !== "opencode")) {
+      throw new Error("That account no longer exists.");
+    }
+    const fingerprint = credentialFingerprint(credentials);
+    const duplicate = accountsOf(state, "opencode").find(
+      (account) => account.id !== existing?.id && account.identity === fingerprint,
+    );
+    if (duplicate) throw new Error(`That key is already added as "${duplicate.label}".`);
+
+    const identity = {
+      signedIn: true,
+      email: null,
+      plan: planOf(credentials),
+      organization: null,
+      identity: fingerprint,
+    };
+    if (existing?.kind === "main") {
+      // The user's own login: the new key replaces the old one in their OpenCode auth file, so
+      // the OpenCode CLI itself uses it too.
+      await writeMainCredentials(credentials);
+      await this.store.update((draft) => {
+        const account = findAccount(draft, existing.id);
+        if (!account) return;
+        applyIdentity(account, identity, draft);
+        account.limitedUntil = null;
+        account.limitKind = null;
+      });
+      console.log(`[ZeroSub] updated the OpenCode login for ${existing.label}`);
+      this.identityCheckedAt.set(existing.id, Date.now());
+      void this.refreshUsage(existing.id, true).catch(() => undefined);
+      return existing.id;
+    }
+    let accountId = existing?.id;
+    if (!existing) {
+      accountId = `opencode-${randomBytes(6).toString("hex")}`;
+      const home = join(homesDir(), accountId);
+      await this.adapters.opencode.prepareHome(home);
+      await writeCredentials(home, credentials);
+      await this.store.update((draft) => {
+        const account = newAccount({ id: accountId as string, family: "opencode", kind: "managed", home });
+        applyIdentity(account, identity, draft);
+        if (input.label?.trim()) {
+          account.label = input.label.trim();
+          account.autoLabel = false;
+        }
+        draft.accounts.push(account);
+      });
+    } else if (existing.home) {
+      await writeCredentials(existing.home, credentials);
+      await this.store.update((draft) => {
+        const account = findAccount(draft, existing.id);
+        if (!account) return;
+        applyIdentity(account, identity, draft);
+        account.limitedUntil = null;
+        account.limitKind = null;
+      });
+    } else {
+      throw new Error("That account has no saved keys.");
+    }
+    if (!accountId) throw new Error("That account could not be saved.");
+    this.identityCheckedAt.set(accountId, Date.now());
+    void this.refreshUsage(accountId, true).catch(() => undefined);
+    this.requestProviderSync();
+    console.log(`[ZeroSub] saved the OpenCode account ${accountId}`);
+    return accountId;
+  }
+
   async rename(accountId: string, label: string): Promise<void> {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
@@ -1563,7 +1683,9 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout` or `codex logout` instead.");
+      throw new Error(
+        "Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout` or `opencode auth logout` instead.",
+      );
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
